@@ -32,6 +32,13 @@ Per-cluster values are set under `[tool.cluv.clusters.<name>]`.
     `comment = "cost $5"` reaches `sbatch` as `cost `, since `$5` is expanded (to nothing), and
     `$(...)` is run. So only use `$` to refer to a variable.
 
+!!! note "Overriding the default `project_dir` with `CLUV_REPO_DIR`"
+    By default, a project with no `project_dir` goes to the same path relative to `$HOME` on the
+    clusters as it has locally. If the `CLUV_REPO_DIR` environment variable is set (e.g. to
+    `$HOME/repos/my_repo`), the project's git repo is cloned there instead, and a project in a
+    subfolder of the repo (e.g. `examples/foo`) gets `$HOME/repos/my_repo/examples/foo`. A
+    `project_dir` set in the config still takes precedence.
+
 ## How global and per-cluster settings merge
 
 For both `env` and `sbatch_args`, per-cluster values are merged on top of the global defaults.
