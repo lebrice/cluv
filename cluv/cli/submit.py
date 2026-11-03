@@ -21,6 +21,7 @@ import rich.text
 from rich.live import Live
 
 from cluv.cache import Job, Submission, get_submission_log_dir, save_job
+from cluv.cli.submit_utils import dry_run
 from cluv.cli.submit_utils.chunking import apply_chunking
 from cluv.cli.submit_utils.vram import expand_for_vram
 from cluv.cli.sync import (
@@ -166,6 +167,7 @@ async def submit(
     sync_datasets: bool = True,
     fetch_results: bool = True,
     parsable: bool = False,
+    test_only: bool = False,
 ) -> Job | None:
     """Submit a job to the given cluster (or all clusters if `cluster=="first"`),
     and return the Job object if successful.
@@ -177,6 +179,10 @@ async def submit(
     is 'first') to stdout, for programmatic use, instead of the usual human-readable summary.
     Everything else (logs, the live jobs table, command outputs) is silenced, as with `--quiet`.
 
+    If `test_only` is True, nothing is submitted (and nothing is synced, committed or recorded):
+    `sbatch --test-only` is run for every job configuration that would have been submitted, and
+    a table of the estimated start times (or the reason Slurm rejects them) is printed.
+
     Returns None if the submission failed.
     """
     # `--parsable` promises that stdout carries nothing but the job id. `--quiet` already suppresses
@@ -184,6 +190,24 @@ async def submit(
     # `cluv.remote.run`, which check `console.quiet` too), so it is all this needs to do.
     if parsable:
         console.quiet = True
+    if test_only:
+        cluster_to_remote = await get_cluster_to_remote(cluster)
+        submissions = [
+            submission
+            for cluster_name, remote in cluster_to_remote.items()
+            for submission in await get_submissions(
+                cluster=cluster_name,
+                remote=remote,
+                job_script=job_script,
+                sbatch_args=sbatch_args,
+                program_args=program_args,
+                chunking=chunking,
+                vram=vram,
+                git_commit="test-only",
+            )
+        ]
+        await dry_run.test_only(submissions)
+        return None
     submit_command = build_submit_command(
         cluster=cluster, job_script=job_script, sbatch_args=sbatch_args, program_args=program_args
     )
