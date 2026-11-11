@@ -1,7 +1,4 @@
 #!/bin/bash
-# Mila cluster: 1 of the 4 L40S GPUs of a cn-l node (48 cores / 1TB of RAM per node), so 1/4 of its
-# cores. Ask for more with `--ntasks-per-node` and `--gpus-per-node`; `--cpus-per-task` and
-# `--mem-per-gpu` are per-GPU shares already, so they don't need to change with them.
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=l40s:1
