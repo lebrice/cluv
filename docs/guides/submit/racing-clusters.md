@@ -56,6 +56,13 @@ expected component must be terminal. Cancellation has a 60-second overall deadli
 and fails visibly with unresolved IDs/states instead of reporting success. Do not
 start another expensive race while loser cancellation remains unconfirmed.
 
+If `sacct` omits never-allocated heterogeneous siblings, cluv queries the live
+controller with `scontrol show job -o`. It accepts a state only when all expected
+offsets, the leader, the exact `HetJobIdSet` and the known race name agree. Missing,
+conflicting or still-running components do not become terminal by inference.
+Slurm queries and cancellation run in login shells so site-provided command paths
+are available. Controller-query failures remain visible within bounded cleanup.
+
 Preparation runs once per cluster before account variants are submitted. Known
 shared-filesystem aliases serialize checkout/runtime preparation; independent
 queued job lifetimes remain concurrent. In-flight `sbatch` requests are allowed to

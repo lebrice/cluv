@@ -635,6 +635,11 @@ async def update_job_states_with_sacct(
         remote,
         [job.job.job_id for job in jobs],
         expected_components={job.job_id: component_count(job.job) for job in jobs},
+        expected_job_names={
+            job.job_id: job.job.sbatch_args["job-name"]
+            for job in jobs
+            if "job-name" in job.job.sbatch_args
+        },
     )
     for job, state in zip(jobs, job_states):
         job.state = state.strip().split()[0]  # keep only the first word of the state?
@@ -698,7 +703,9 @@ async def run_scancel(jobs: list[SubmissionProgress]) -> None:
 
     async def cancel(remote: Remote | None, cluster_rows: list[SubmissionProgress]) -> None:
         job_ids = [job.job_id for job in cluster_rows if job.job_id is not None]
-        scancel_command = f"scancel {' '.join(map(str, job_ids))}"
+        scancel_command = (
+            f"bash --login -c {shlex.quote('scancel ' + ' '.join(map(str, job_ids)))}"
+        )
         if remote is not None:
             await remote.get_output(scancel_command, hide=True)
         else:

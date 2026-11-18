@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -97,7 +98,10 @@ def parse_slurm_time(time: str) -> timedelta:
 
 
 async def get_job_states_with_sacct(
-    remote: Remote | None, jobs: list[int], expected_components: dict[int, int] | None = None
+    remote: Remote | None,
+    jobs: list[int],
+    expected_components: dict[int, int] | None = None,
+    expected_job_names: dict[int, str] | None = None,
 ) -> list[str]:
     """Run sacct on the given job id(s) and return the output as a list of lines."""
     if not jobs:
@@ -112,7 +116,74 @@ async def get_job_states_with_sacct(
     # Need to unpack and assign the states to the right JobIDs, because sacct actually
     # outputs states in increasing order of Job IDs!
     job_id_to_state = parse_sacct_job_states(output, expected_components)
+    # Never-allocated het siblings can be absent from accounting. Confirm the
+    # complete allocation from the live controller instead of inferring a state
+    # from the leader alone (or assuming consecutive component job IDs).
+    for job_id in jobs:
+        count = (expected_components or {}).get(job_id, 1)
+        if count <= 1 or job_id_to_state.get(job_id, "UNKNOWN") != "UNKNOWN":
+            continue
+        command = f"bash --login -c 'scontrol show job -o {job_id}'"
+        async with asyncio.timeout(10):
+            if remote:
+                control = await remote.get_output(command, hide=True)
+            else:
+                result = await run(tuple(shlex.split(command)), hide=True)
+                control = result.stdout
+        job_id_to_state[job_id] = parse_scontrol_het_state(
+            control, job_id, count, (expected_job_names or {}).get(job_id)
+        )
     return [job_id_to_state.get(job_id, "UNKNOWN") for job_id in jobs]
+
+
+def parse_scontrol_het_state(
+    output: str, leader: int, expected: int, job_name: str | None = None
+) -> str:
+    """Require all offsets and the exact controller-declared component ID set."""
+    parts = {}
+    declared = None
+    for record in re.split(r"(?=^JobId=)", output.strip(), flags=re.MULTILINE):
+        if not record.strip():
+            continue
+        fields = dict(
+            re.findall(
+                r"(?:^|\s)(JobId|HetJobId|HetJobOffset|HetJobIdSet|JobName|JobState)=([^\s]+)",
+                record,
+            )
+        )
+        try:
+            identity = int(fields["JobId"]), int(fields["HetJobId"]), int(fields["HetJobOffset"])
+            if identity[1] != leader or not 0 <= identity[2] < expected:
+                return "UNKNOWN"
+            if job_name is not None and fields.get("JobName") != job_name:
+                return "UNKNOWN"
+            ids = set()
+            for interval in fields["HetJobIdSet"].split(","):
+                match = re.fullmatch(r"(\d+)(?:-(\d+))?", interval)
+                if match is None:
+                    return "UNKNOWN"
+                first, last = int(match[1]), int(match[2] or match[1])
+                if last < first or last - first + 1 > expected:
+                    return "UNKNOWN"
+                ids.update(range(first, last + 1))
+            if len(ids) != expected or (declared is not None and ids != declared):
+                return "UNKNOWN"
+            declared = ids
+            state = fields["JobState"].rstrip("+")
+            item = identity[0], state
+            if identity[2] in parts and parts[identity[2]] != item:
+                return "UNKNOWN"
+            parts[identity[2]] = item
+        except (KeyError, ValueError):
+            return "UNKNOWN"
+    if set(parts) != set(range(expected)) or parts[0][0] != leader:
+        return "UNKNOWN"
+    if {item[0] for item in parts.values()} != declared:
+        return "UNKNOWN"
+    return parse_sacct_job_states(
+        "\n".join(f"{leader}+{offset}|{item[1]}" for offset, item in parts.items()),
+        {leader: expected},
+    )[leader]
 
 
 def parse_sacct_job_states(

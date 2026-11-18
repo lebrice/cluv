@@ -117,7 +117,7 @@ sbatch_args = [{account="cc-debug_gpu"},{account="def-user_gpu"},{account="rrg-u
                     )
                 lines += [f"{job_id}+{i}|{s}" for i, s in enumerate(states)]
             output = "\n".join(lines)
-        elif command == "scancel 200":
+        elif command == shlex.join(("bash", "--login", "-c", "scancel 200")):
             cancelled.append(200)
             output = ""
         else:
@@ -588,7 +588,7 @@ async def test_race_failure_cleans_all_known_siblings_without_reporting_success(
                 else "200"
             )
         elif "scancel" in command:
-            cancelled.extend(int(value) for value in argv[1:])
+            cancelled.extend(int(value) for value in shlex.split(argv[-1])[1:])
             if failure == "cleanup":
                 raise RuntimeError("cleanup denied")
             output = ""
