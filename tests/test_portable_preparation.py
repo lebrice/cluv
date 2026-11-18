@@ -197,7 +197,7 @@ async def test_unresolved_controller_inputs_fail_before_git_push_or_transfer(
     monkeypatch.setattr(sync, "run_git_push_if_needed", push)
     monkeypatch.setattr(sync, "pull_datasets_if_needed", pull)
     with pytest.raises(RuntimeError, match="controller|Controller"):
-        await sync.sync_common_part([])
+        await sync.sync_common_part({"narval": None})
     push.assert_not_called()
     pull.assert_not_called()
 

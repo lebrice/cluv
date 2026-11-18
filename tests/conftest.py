@@ -5,7 +5,6 @@ import pytest
 import pytest_asyncio
 
 import cluv.config
-import cluv.remote
 from cluv.cli.login import get_remote_without_2fa_prompt
 from cluv.config import get_cluv_config, set_local_env_vars
 from cluv.remote import Remote, control_socket_is_running
