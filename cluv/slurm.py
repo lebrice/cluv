@@ -14,6 +14,14 @@ from datetime import datetime, timedelta, timezone
 from cluv.remote import Remote, run
 
 FAILED_JOB_STATES = ["FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"]
+TERMINAL_JOB_STATES = [
+    *FAILED_JOB_STATES,
+    "COMPLETED",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "REVOKED",
+    "SPECIAL_EXIT",
+]
 
 
 @dataclass
@@ -88,7 +96,9 @@ def parse_slurm_time(time: str) -> timedelta:
     return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
 
 
-async def get_job_states_with_sacct(remote: Remote | None, jobs: list[int]) -> list[str]:
+async def get_job_states_with_sacct(
+    remote: Remote | None, jobs: list[int], expected_components: dict[int, int] | None = None
+) -> list[str]:
     """Run sacct on the given job id(s) and return the output as a list of lines."""
     if not jobs:
         return []
@@ -101,26 +111,52 @@ async def get_job_states_with_sacct(remote: Remote | None, jobs: list[int]) -> l
         output = result.stdout.strip()
     # Need to unpack and assign the states to the right JobIDs, because sacct actually
     # outputs states in increasing order of Job IDs!
-    job_id_to_state = parse_sacct_job_states(output)
-    return [job_id_to_state[job_id] for job_id in jobs]
+    job_id_to_state = parse_sacct_job_states(output, expected_components)
+    return [job_id_to_state.get(job_id, "UNKNOWN") for job_id in jobs]
 
 
-def parse_sacct_job_states(output: str) -> dict[int, str]:
+def parse_sacct_job_states(
+    output: str, expected_components: dict[int, int] | None = None
+) -> dict[int, str]:
     """Parse `job_id|state` lines from sacct into one state per job.
 
     A job array has one line per task (`1234_0`, `1234_[1-3]`), and a heterogeneous job (`#SBATCH
-    hetjob`) one per component (`1234+0`, `1234+1`). The job is RUNNING or COMPLETED as soon as one
-    of these is, else PENDING if one is pending, else the state of the first one.
+    hetjob`) one per component (`1234+0`, `1234+1`). Arrays retain their aggregate
+    started state. Heterogeneous jobs require every expected component running or
+    every component terminal; missing components are UNKNOWN and mixed phases INCOMPLETE.
     """
     states_per_job: dict[int, list[str]] = defaultdict(list)
+    components: dict[int, dict[int, str]] = defaultdict(dict)
     for line in output.splitlines():
         job_id_str, _, state = line.partition("|")
         job_id = int(re.split(r"[_+]", job_id_str, maxsplit=1)[0])
         states_per_job[job_id].append(state)
-    return {
-        job_id: next((s for s in ("RUNNING", "COMPLETED", "PENDING") if s in states), states[0])
-        for job_id, states in states_per_job.items()
-    }
+        if "+" in job_id_str:
+            components[job_id][int(job_id_str.split("+", 1)[1])] = state.split()[0].rstrip("+")
+    result = {}
+    for job_id, states in states_per_job.items():
+        expected = (expected_components or {}).get(job_id, 1)
+        if job_id in components or expected > 1:
+            parts = components[job_id]
+            if set(parts) != set(range(expected if expected > 1 else max(parts, default=0) + 1)):
+                result[job_id] = "UNKNOWN"
+            elif all(s == "RUNNING" for s in parts.values()):
+                result[job_id] = "RUNNING"
+            elif all(s in TERMINAL_JOB_STATES for s in parts.values()):
+                result[job_id] = (
+                    "COMPLETED"
+                    if all(s == "COMPLETED" for s in parts.values())
+                    else next(s for s in parts.values() if s != "COMPLETED")
+                )
+            elif all(s == "PENDING" for s in parts.values()):
+                result[job_id] = "PENDING"
+            else:
+                result[job_id] = "INCOMPLETE"
+        else:
+            result[job_id] = next(
+                (s for s in ("RUNNING", "COMPLETED", "PENDING") if s in states), states[0]
+            )
+    return result
 
 
 async def run_sacct(

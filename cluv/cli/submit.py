@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import dataclasses
 import datetime
+import fnmatch
+import hashlib
 import functools
 import itertools
 import logging
@@ -10,6 +12,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import traceback
 import typing
 from contextvars import ContextVar
@@ -37,17 +40,37 @@ from cluv.cli.sync import (
 from cluv.config import ClusterConfig, find_pyproject, get_cluv_config
 from cluv.remote import Remote, command_log_files, run
 from cluv.sbatch_args import SbatchArgs, sbatch_args_from_list, sbatch_args_to_list
-from cluv.slurm import FAILED_JOB_STATES, get_job_states_with_sacct
+from cluv.slurm import TERMINAL_JOB_STATES, get_job_states_with_sacct
 from cluv.utils import console, gather_dict, group_by_cluster, set_context
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["submit"]
 
+
+def csv_selection(value: str | None) -> list[str]:
+    return list(dict.fromkeys(item.strip() for item in (value or "").split(",") if item.strip()))
+
+
+def component_count(submission: Submission) -> int:
+    return len(submission.sbatch_args.get("__het_components__", [])) + 1
+
+
+def eligible_submission(
+    submission: Submission, accounts: list[str] | None, excluded: list[str]
+) -> bool:
+    groups = [submission.sbatch_args, *submission.sbatch_args.get("__het_components__", [])]
+    configured = [str(group.get("account", "")) for group in groups]
+    return not any(
+        fnmatch.fnmatchcase(a, pattern) for a in configured for pattern in excluded
+    ) and (accounts is None or all(a in accounts for a in configured))
+
+
 display_commands = ContextVar("display_commands", default=True)
 raise_on_command_error = ContextVar("raise_on_command_error", default=False)
 
 JobState = str
+SUBMIT_TIMEOUT_SECONDS = 60
 
 
 class ClusterSyncFailed(Exception):
@@ -56,6 +79,14 @@ class ClusterSyncFailed(Exception):
 
 class JobSubmissionFailed(Exception):
     """Raised when a job submission fails."""
+
+
+class SubmissionOutcomeUnknown(RuntimeError):
+    """sbatch may have allocated a job; never retry or report a clean race."""
+
+    def __init__(self, message: str, *, job: Job | None = None):
+        super().__init__(message)
+        self.job = job
 
 
 JobSubmission = TypeVar("JobSubmission", Submission, Job)
@@ -173,6 +204,9 @@ async def submit(
     fetch_results: bool = True,
     parsable: bool = False,
     test_only: bool = False,
+    eligible_clusters: str | None = None,
+    eligible_accounts: str | None = None,
+    exclude_accounts: str | None = None,
 ) -> Job | None:
     """Submit a job to the given cluster (or all clusters if `cluster=="first"`),
     and return the Job object if successful.
@@ -196,21 +230,43 @@ async def submit(
     # `cluv.remote.run`, which check `console.quiet` too), so it is all this needs to do.
     if parsable:
         console.quiet = True
+    policy = get_cluv_config().submit
+    approved_clusters = (
+        csv_selection(eligible_clusters)
+        if eligible_clusters is not None
+        else policy.eligible_clusters
+    )
+    approved_accounts = (
+        csv_selection(eligible_accounts)
+        if eligible_accounts is not None
+        else policy.eligible_accounts
+    )
+    excluded_accounts = [*policy.exclude_accounts, *csv_selection(exclude_accounts)]
+    if approved_clusters == [] or approved_accounts == []:
+        raise ValueError("Explicit eligible cluster/account selection cannot be empty")
+    if approved_clusters and set(approved_clusters) - set(get_cluv_config().clusters_names):
+        raise ValueError("Eligible cluster selection contains an unconfigured cluster")
+    if approved_clusters and cluster != "first" and cluster not in approved_clusters:
+        raise ValueError(f"Cluster {cluster!r} is outside the eligible cluster policy")
     if test_only:
         await submit_test_only(
-            cluster,
+            approved_clusters if cluster == "first" and approved_clusters else cluster,
             job_script=job_script,
             sbatch_args=sbatch_args,
             program_args=program_args,
             chunking=chunking,
             vram=vram,
+            eligible_accounts=approved_accounts,
+            exclude_accounts=excluded_accounts,
         )
         return None
     submit_command = build_submit_command(
         cluster=cluster, job_script=job_script, sbatch_args=sbatch_args, program_args=program_args
     )
     git_commit = ensure_clean_git_state(autocommit=autocommit, submit_command=submit_command)
-    cluster_to_remote = await get_cluster_to_remote(cluster)
+    cluster_to_remote = await get_cluster_to_remote(
+        approved_clusters if cluster == "first" and approved_clusters else cluster
+    )
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = get_submission_log_dir()
@@ -232,6 +288,13 @@ async def submit(
             for cluster_name, remote in cluster_to_remote.items()
         }
     )
+    for name, submissions in _cluster_to_submissions.items():
+        _cluster_to_submissions[name] = [
+            s for s in submissions if eligible_submission(s, approved_accounts, excluded_accounts)
+        ]
+    _cluster_to_submissions = {k: v for k, v in _cluster_to_submissions.items() if v}
+    if not _cluster_to_submissions:
+        raise ValueError("No eligible configured cluster/account submissions")
 
     # Wrap the submissions in a mutable dataclass where we will modify the `state` and maybe set the `job` fields.
     cluster_to_job_submissions = {
@@ -298,11 +361,17 @@ async def submit(
                     console.log(f"  {job.job_id} on {job.cluster}")
             await wait_for_jobs_to_cancel(jobs_to_cancel, cluster_to_remote)
             live.refresh()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        # The user stopped `cluv submit` while jobs were still in flight -- cancel everything.
-        console.log("Interrupted by user. Cancelling all submitted jobs...")
-        all_jobs = list(itertools.chain.from_iterable(cluster_to_job_submissions.values()))
-        await run_scancel(all_jobs)
+    except BaseException as error:
+        # A parser, polling or transport failure is not permission to leave
+        # successful siblings running. Unknown IDs remain explicitly unresolved.
+        console.log("Race interrupted or failed. Cleaning up all known allocations...")
+        all_jobs = [
+            row for rows in cluster_to_job_submissions.values() for row in rows if has_job(row)
+        ]
+        try:
+            await wait_for_jobs_to_cancel(all_jobs, cluster_to_remote)
+        except Exception as cleanup_error:
+            error.add_note(f"Known-job cleanup also failed: {cleanup_error}")
         raise
 
     job = winning_job.job
@@ -330,6 +399,8 @@ async def submit_test_only(
     program_args: list[str],
     chunking: int | None,
     vram: str | None,
+    eligible_accounts: list[str] | None = None,
+    exclude_accounts: list[str] | None = None,
 ) -> list[dry_run.TestOnlyResult]:
     """`cluv submit --test-only`: push the current commit, pull it on each cluster, and run
     `sbatch --test-only` there, the way `cluv submit` would run `sbatch` (same directory, same
@@ -368,6 +439,11 @@ async def submit_test_only(
             )
 
     try:
+        submissions = [
+            s
+            for s in submissions
+            if eligible_submission(s, eligible_accounts, exclude_accounts or [])
+        ]
         await run_git_push_if_needed()
     except Exception as err:
         error = f"git push failed: {_command_error(err)}"
@@ -457,10 +533,17 @@ async def wait_for_first_running_job(
     # Need one remote for each cluster that has job submissions.
     assert set(cluster_to_remote.keys()) >= set(cluster_to_job_submissions.keys())
     all_submissions = list(itertools.chain.from_iterable(cluster_to_job_submissions.values()))
+    preparation_locks: dict[frozenset[str], asyncio.Lock] = {}
+
+    def preparation_lock(cluster: str) -> asyncio.Lock:
+        group = next(
+            (g for g in CLUSTERS_SHARING_A_FILESYSTEM if cluster in g), frozenset({cluster})
+        )
+        return preparation_locks.setdefault(group, asyncio.Lock())
 
     # Errors are reported (and stored on the submissions) by `sync_and_submit_jobs_to_cluster`.
-    sync_and_submit = asyncio.gather(
-        *(
+    cluster_tasks = {
+        cluster_name: asyncio.create_task(
             sync_and_submit_jobs_to_cluster(
                 cluster_name,
                 remote=cluster_to_remote[cluster_name],
@@ -469,14 +552,28 @@ async def wait_for_first_running_job(
                 _skip_sync=_skip_sync,
                 sync_datasets=sync_datasets,
                 fetch_results=fetch_results,
+                preparation_lock=preparation_lock(cluster_name),
             )
-            for cluster_name, cluster_job_submissions in cluster_to_job_submissions.items()
-        ),
-        return_exceptions=True,
-    )
+        )
+        for cluster_name, cluster_job_submissions in cluster_to_job_submissions.items()
+    }
+    sync_and_submit = asyncio.gather(*cluster_tasks.values(), return_exceptions=True)
     delay = initial_delay
     try:
         while True:
+            fatal_errors = [
+                task.exception()
+                for task in cluster_tasks.values()
+                if task.done()
+                and not task.cancelled()
+                and task.exception() is not None
+                and not isinstance(task.exception(), ClusterSyncFailed)
+            ]
+            if fatal_errors:
+                found_running_job.set()
+                raise ExceptionGroup(
+                    "Submission outcomes require reconciliation; no retry", fatal_errors
+                )
             # Read both before awaiting, so no job can get submitted in between.
             submitted_everywhere = sync_and_submit.done()
             queued_jobs = [s for s in all_submissions if has_job(s)]
@@ -498,31 +595,47 @@ async def wait_for_first_running_job(
                 return started_jobs[0]
 
             if submitted_everywhere:
-                if all(j.state.startswith(tuple(FAILED_JOB_STATES)) for j in queued_jobs):
+                if all(
+                    j.state in TERMINAL_JOB_STATES and j.state != "COMPLETED" for j in queued_jobs
+                ):
                     console.print(
                         f"Submitted {len(all_submissions)} jobs but none succeeded!", style="red"
                     )
                     return None
                 # Skip the wait if we'd only be waiting on one job to start.
                 pending_jobs = [j for j in queued_jobs if j.state == "PENDING"]
-                if len(pending_jobs) == 1:
+                if len(pending_jobs) == 1 and all(
+                    j is pending_jobs[0] or j.state in TERMINAL_JOB_STATES for j in queued_jobs
+                ):
                     console.log("Only one job pending. Skipping wait for a running job.")
                     return pending_jobs[0]
 
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_wait_time_seconds)
     finally:
-        sync_and_submit.cancel()
-        # Retrieve the gather's `CancelledError`, otherwise asyncio complains that it was never
-        # retrieved when the future gets garbage-collected.
-        with contextlib.suppress(asyncio.CancelledError):
-            await sync_and_submit
+        # Never interrupt an sbatch request: it may already have allocated a job
+        # whose ID we still need to record and cancel. Sync-only tasks own no jobs.
+        for name, task in cluster_tasks.items():
+            if not any(row.state == "SUBMITTING" for row in cluster_to_job_submissions[name]):
+                task.cancel()
+        results = await sync_and_submit
+        errors = [
+            result
+            for result in results
+            if isinstance(result, Exception) and not isinstance(result, ClusterSyncFailed)
+        ]
+        if errors and sys.exc_info()[0] is None:
+            raise ExceptionGroup("Submission outcomes require reconciliation; no retry", errors)
 
 
 async def update_job_states_with_sacct(
     remote: Remote | None, jobs: list[SubmissionProgress[Job]]
 ) -> None:
-    job_states = await get_job_states_with_sacct(remote, [job.job.job_id for job in jobs])
+    job_states = await get_job_states_with_sacct(
+        remote,
+        [job.job.job_id for job in jobs],
+        expected_components={job.job_id: component_count(job.job) for job in jobs},
+    )
     for job, state in zip(jobs, job_states):
         job.state = state.strip().split()[0]  # keep only the first word of the state?
 
@@ -537,31 +650,35 @@ async def wait_for_jobs_to_cancel(
     cluster_to_job_submissions = group_by_cluster(job_submissions)
 
     assert all(job.job_id is not None for job in job_submissions)
-    cluster_to_job_ids = {
-        cluster: [job.job_id for job in cluster_jobs if job.job_id is not None]
-        for cluster, cluster_jobs in cluster_to_job_submissions.items()
-    }
     delay = initial_delay
+    deadline = time.monotonic() + max_wait_time_seconds
+    last_error = None
 
-    while not all(
-        job.state.startswith(("CANCELLED", "COMPLETED", "FAILED")) for job in job_submissions
-    ):
+    while not all(job.state.startswith(tuple(TERMINAL_JOB_STATES)) for job in job_submissions):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Loser cancellation unconfirmed: {[(j.cluster, j.job_id, j.state) for j in job_submissions]}; last error: {last_error}"
+            )
         for job in job_submissions:
             try:
-                await run_scancel([job])
+                await asyncio.wait_for(run_scancel([job]), max(0.001, deadline - time.monotonic()))
             except Exception as err:
-                logging.debug(f"Error running scancel for job {job.job_id}: {err}")
-        job_states = await gather_dict(
-            {
-                cluster: get_job_states_with_sacct(cluster_to_remote[cluster], cluster_job_ids)
-                for cluster, cluster_job_ids in cluster_to_job_ids.items()
-            }
-        )
-        for cluster, cluster_jobs in cluster_to_job_submissions.items():
-            for job, state in zip(cluster_jobs, job_states[cluster]):
-                job.state = state.strip().split()[0]  # keep only the first word of the state.
-
-        await asyncio.sleep(delay)
+                last_error = repr(err)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        update_job_states_with_sacct(cluster_to_remote[c], rows)
+                        for c, rows in cluster_to_job_submissions.items()
+                    )
+                ),
+                max(0.001, deadline - time.monotonic()),
+            )
+        except Exception as err:
+            last_error = repr(err)
+        if all(job.state.startswith(tuple(TERMINAL_JOB_STATES)) for job in job_submissions):
+            break
+        await asyncio.sleep(min(delay, max(0, deadline - time.monotonic())))
         delay = min(delay * 2, max_wait_time_seconds)
     console.log(f"Cancelled {len(job_submissions)} job submission(s).")
     for job_submission in job_submissions:
@@ -587,7 +704,7 @@ async def run_scancel(jobs: list[SubmissionProgress]) -> None:
         else:
             await run(tuple(shlex.split(scancel_command)), hide=True)
 
-    await asyncio.gather(
+    results = await asyncio.gather(
         *(
             cancel(remote, cluster_rows)
             for remote, cluster_rows in by_remote.items()
@@ -595,6 +712,9 @@ async def run_scancel(jobs: list[SubmissionProgress]) -> None:
         ),
         return_exceptions=True,  # so we don't stop all the cancels if one fails.
     )
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise ExceptionGroup("Unable to cancel all submitted jobs", errors)
 
 
 async def sync_and_submit_jobs_to_cluster(
@@ -605,6 +725,7 @@ async def sync_and_submit_jobs_to_cluster(
     _skip_sync: bool = False,
     sync_datasets: bool = True,
     fetch_results: bool = True,
+    preparation_lock: asyncio.Lock | None = None,
 ) -> list[SubmissionProgress[Job]]:
     """Sync then submit every submission for one cluster, in parallel.
 
@@ -627,9 +748,10 @@ async def sync_and_submit_jobs_to_cluster(
     if not _skip_sync:
         try:
             with logging_commands_to(tuple(row.log_path for row in job_submissions)):
-                await sync_per_cluster_part(
-                    remote, sync_datasets=sync_datasets, sync_results=fetch_results
-                )
+                async with preparation_lock or asyncio.Lock():
+                    await sync_per_cluster_part(
+                        remote, sync_datasets=sync_datasets, sync_results=fetch_results
+                    )
         except Exception as exc:
             console.log(f"Failed to sync with cluster {cluster}: {exc}")
             for job_submission in job_submissions:
@@ -658,20 +780,39 @@ async def sync_and_submit_jobs_to_cluster(
 
     assert len(results) == len(job_submissions)
     successful_job_submissions: list[SubmissionProgress[Job]] = []
+    unexpected = []
+    # Register every returned allocation before any reporting/file I/O can fail.
+    for job_submission, result in zip(job_submissions, results):
+        known = (
+            result
+            if isinstance(result, Job)
+            else (result.job if isinstance(result, SubmissionOutcomeUnknown) else None)
+        )
+        if known is not None:
+            job_submission.job = known
+            job_submission.state = "PENDING"
+            successful_job_submissions.append(job_submission)
     for job_submission, result in zip(job_submissions, results):
         if isinstance(result, Job):
-            job_submission.job = result
-            job_submission.state = "PENDING"
-            assert has_job(job_submission)
-            successful_job_submissions.append(job_submission)
-        elif isinstance(result, JobSubmissionFailed):
+            continue
+        if isinstance(result, JobSubmissionFailed):
             job_submission.error = result
             job_submission.state = "FAILED"
             console.log(f"[red]{result}[/red]")
         else:
             assert isinstance(result, BaseException)
-            logger.error(f"Unexpected exception: {result}")
-            raise result
+            if not has_job(job_submission):
+                job_submission.state = "UNKNOWN (submission outcome)"
+            unexpected.append(result)
+            try:
+                with job_submission.log_path.open("a") as receipt:
+                    receipt.write(f"\nUnresolved submission error: {result!r}\n")
+            except OSError as receipt_error:
+                result.add_note(f"Receipt append also failed: {receipt_error}")
+    if unexpected:
+        raise BaseExceptionGroup(
+            "Uncertain submissions; all known sibling IDs retained", unexpected
+        )
     return successful_job_submissions
 
 
@@ -699,6 +840,12 @@ async def get_submissions(
     submissions: list[Submission] = []
     config = get_cluv_config()
     cluster_config = config.get_cluster_config(cluster)
+    if remote is None:
+        # The controller may run a staged checkout distinct from the configured
+        # remote checkout. Never cd back to an unrelated older local repository.
+        cluster_config = dataclasses.replace(
+            cluster_config, project_dir=PurePosixPath(str(find_pyproject().parent.resolve()))
+        )
     job_resources_options = cluster_config.sbatch_args
 
     # Get job vars
@@ -712,12 +859,24 @@ async def get_submissions(
     )
 
     # Get the job script path on the remote cluster
-    cluster_job_script_path = get_cluster_job_script_path(
-        local_job_script_path=local_job_script_path, cluster=cluster, cluster_config=cluster_config
+    cluster_job_script_path = (
+        PurePosixPath(
+            local_job_script_path.resolve().relative_to(find_pyproject().parent.resolve())
+        )
+        if remote is None
+        else get_cluster_job_script_path(
+            local_job_script_path=local_job_script_path,
+            cluster=cluster,
+            cluster_config=cluster_config,
+        )
     )
 
     for job_resources in job_resources_options:
-        job_resources = merge_sbatch_args(from_config=job_resources, from_cli=sbatch_args)
+        job_resources = merge_job_resources(local_job_script_path, job_resources, sbatch_args)
+        if component_count_args(job_resources) > 1 and (vram is not None or chunking is not None):
+            raise ValueError(
+                "Heterogeneous jobs require explicit per-component GPUs and time; --vram/--chunking are unsupported"
+            )
         n_chunks, job_resources = apply_chunking(
             job_resources,
             job_script=local_job_script_path,
@@ -746,6 +905,9 @@ async def get_submissions(
                 program_args=program_args,
                 project_dir_on_cluster=cluster_config.project_dir,
                 test_only=test_only,
+                script_contents=local_job_script_path.read_text()
+                if component_count_args(expanded_resources) > 1
+                else None,
             )
             submissions.append(
                 Submission(
@@ -760,6 +922,44 @@ async def get_submissions(
                 )
             )
     return submissions
+
+
+def component_count_args(args: SbatchArgs) -> int:
+    return 1 + len(args.get("__het_components__", []))
+
+
+def merge_job_resources(script: Path, configured: SbatchArgs, cli: list[str]) -> SbatchArgs:
+    """Preserve het headers; common config/CLI options apply to each component.
+
+    With explicit ':' separators, CLI groups instead override their matching
+    header groups. Configured account/time defaults still apply to every group.
+    """
+    header = []
+    for line in script.read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            break
+        if stripped.startswith("#SBATCH"):
+            flags = shlex.split(stripped.removeprefix("#SBATCH").strip())
+            header.extend([":"] if flags in (["hetjob"], ["--hetjob"]) else flags)
+    parsed_header = sbatch_args_from_list(header)
+    parsed_cli = sbatch_args_from_list(cli)
+    header_groups = [parsed_header, *parsed_header.get("__het_components__", [])]
+    cli_groups = [parsed_cli, *parsed_cli.get("__het_components__", [])]
+    if len(header_groups) == len(cli_groups) == 1:
+        return merge_sbatch_args(configured, cli)
+    if len(cli_groups) > 1 and len(cli_groups) != len(header_groups):
+        raise ValueError("CLI heterogeneous component count must match the job header")
+    merged = []
+    for index, header_group in enumerate(header_groups):
+        base = {k: v for k, v in header_group.items() if k != "__het_components__"}
+        base.update(configured)
+        override = cli_groups[index] if len(cli_groups) > 1 else parsed_cli
+        base.update({k: v for k, v in override.items() if k != "__het_components__"})
+        merged.append(base)
+    result = merged[0]
+    result["__het_components__"] = merged[1:]
+    return result
 
 
 def get_local_job_script(
@@ -948,6 +1148,7 @@ def get_sbatch_command(
     env_vars: dict[str, str],
     project_dir_on_cluster: PurePosixPath | None = None,
     test_only: bool = False,
+    script_contents: str | None = None,
 ) -> str:
     """Generate the command to submit the job via `sbatch` on the cluster.
 
@@ -964,6 +1165,16 @@ def get_sbatch_command(
         )
 
     sbatch_flags = sbatch_args_to_list(sbatch_args)
+    stdin_script = None
+    if script_contents is not None:
+        stdin_script = heterogeneous_script(script_contents, sbatch_args)
+        sbatch_flags = sbatch_args_to_list(
+            {
+                key: value
+                for key, value in sbatch_args.items()
+                if key in ("job-name", "output", "chdir", "export")
+            }
+        )
     env_vars_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items())
 
     # These are interpolated unquoted, so the cluster's login shell expands any env vars in them
@@ -1001,7 +1212,41 @@ def get_sbatch_command(
         f"{env_vars_prefix}{cd_command}{sbatch} "
         f"{' '.join(map(double_quote, sbatch_flags))} {job_script} {shlex.join(program_args)}"
     )
+    if stdin_script is not None:
+        delimiter = "CLUV_SCRIPT_" + hashlib.sha256(stdin_script.encode()).hexdigest()
+        inner_command = (
+            f"{env_vars_prefix}{cd_command}{sbatch} "
+            f"{' '.join(map(double_quote, sbatch_flags))} /dev/stdin {shlex.join(program_args)} "
+            f"<<'{delimiter}'\n{stdin_script}\n{delimiter}"
+        )
     return f"bash --login -c {shlex.quote(inner_command)}"
+
+
+def heterogeneous_script(contents: str, args: SbatchArgs) -> str:
+    """Submit through site sbatch filters using header resources, never CLI ':'."""
+    lines = contents.splitlines()
+    shebang = lines.pop(0) if lines and lines[0].startswith("#!") else "#!/bin/bash"
+    boundary = next(
+        (i for i, line in enumerate(lines) if line.strip() and not line.lstrip().startswith("#")),
+        len(lines),
+    )
+    preamble = [line for line in lines[:boundary] if not line.lstrip().startswith("#SBATCH")]
+    groups = [args, *args.get("__het_components__", [])]
+    headers = []
+    for index, group in enumerate(groups):
+        if index:
+            headers.append("#SBATCH hetjob")
+        resources = {
+            k: v
+            for k, v in group.items()
+            if k not in ("__het_components__", "job-name", "output", "chdir", "export")
+        }
+        if "job-name" in args:
+            resources["job-name"] = args["job-name"]
+        flags = sbatch_args_to_list(resources)
+        if flags:
+            headers.append("#SBATCH " + shlex.join(flags))
+    return "\n".join([shebang, *headers, *preamble, *lines[boundary:]])
 
 
 async def submit_job(submission: Submission, log_path: Path) -> Job:
@@ -1013,29 +1258,66 @@ async def submit_job(submission: Submission, log_path: Path) -> Job:
     hide = not display
     warn = not raise_on_command_error.get()
 
-    if submission.remote is not None:
-        result = await submission.remote.run(
-            submission.sbatch_command, display=display, warn=warn, hide=hide
+    try:
+        async with asyncio.timeout(SUBMIT_TIMEOUT_SECONDS):
+            if submission.remote is not None:
+                result = await submission.remote.run(
+                    submission.sbatch_command, display=display, warn=warn, hide=hide
+                )
+            else:
+                result = await run(
+                    tuple(shlex.split(submission.sbatch_command)),
+                    _display=display,
+                    warn=warn,
+                    hide=hide,
+                )
+    except BaseException as error:
+        outcome = SubmissionOutcomeUnknown(
+            f"Unknown sbatch outcome on {submission.cluster}; inspect {log_path}; do not retry"
         )
-    else:
-        result = await run(
-            tuple(shlex.split(submission.sbatch_command)), _display=display, warn=warn, hide=hide
+        try:
+            with log_path.open("a") as receipt:
+                receipt.write(
+                    f"\n--- UNKNOWN submission transport outcome; do not retry ---\n{error!r}\n"
+                )
+        except OSError as receipt_error:
+            outcome.add_note(f"Transport receipt also failed: {receipt_error}")
+        raise outcome from error
+
+    # Preserve stdout/stderr/status before any interpretation can fail.
+    receipt_errors = []
+
+    def retain_receipt(**fields):
+        try:
+            write_submission_log(log_path, result=result, **fields)
+        except OSError as receipt_error:
+            receipt_errors.append(receipt_error)
+
+    def unknown(message, *, job=None):
+        outcome = SubmissionOutcomeUnknown(message, job=job)
+        for receipt_error in receipt_errors:
+            outcome.add_note(f"Receipt persistence failed: {receipt_error}")
+        if receipt_errors:
+            outcome.add_note(
+                f"Raw sbatch response: returncode={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
+            )
+        return outcome
+
+    retain_receipt(job_id=None, error=None, status="RECEIVED")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    candidates = [re.fullmatch(r"([1-9][0-9]*)(?:;[^;\s]+)?", line) for line in lines]
+    valid = [match for match in candidates if match is not None]
+    job_id = int(valid[0][1]) if len(valid) == 1 and candidates[-1] is valid[0] else None
+    if job_id is None:
+        if result.returncode != 0 and "Batch job submission failed:" in result.stderr:
+            raise JobSubmissionFailed(
+                f"sbatch failed on {submission.cluster}; receipt {log_path}: {result.stderr or result.stdout}"
+            )
+        raise unknown(
+            f"Unparsable sbatch response on {submission.cluster}; inspect raw receipt {log_path}; no retry or guessed cancellation"
         )
 
-    job_id = int(result.stdout.strip()) if result.returncode == 0 else None
-    error = None
-    if result.returncode != 0:
-        error = (
-            f"Failed to submit job on cluster {submission.cluster}: "
-            f"{result.stderr or result.stdout}"
-        )
-    write_submission_log(log_path, job_id=job_id, error=error, result=result)
-
-    if error is not None:
-        raise JobSubmissionFailed(error)
-    assert job_id is not None
-
-    return Job(
+    job = Job(
         cluster=submission.cluster,
         remote=submission.remote,
         job_script=submission.job_script,
@@ -1047,6 +1329,13 @@ async def submit_job(submission: Submission, log_path: Path) -> Job:
         job_id=job_id,
         submitted_at=datetime.datetime.now(),
     )
+    retain_receipt(job_id=job_id, error=None)
+    if result.returncode != 0 or receipt_errors:
+        raise unknown(
+            f"sbatch reported ID {job_id} with returncode {result.returncode}; receipt persistence requires review at {log_path}",
+            job=job,
+        )
+    return job
 
 
 @contextlib.contextmanager
@@ -1069,6 +1358,7 @@ def write_submission_log(
     job_id: int | None,
     error: str | None,
     result: subprocess.CompletedProcess[str],
+    status: str | None = None,
 ) -> None:
     """Append the outcome of one `sbatch` call to `log_path`, so it can be found on its own even
     when many submissions' console output is interleaved.
@@ -1076,7 +1366,7 @@ def write_submission_log(
     lines = [
         "",
         "--- submission ---",
-        f"status: {'FAILED' if error is not None else 'SUBMITTED'}",
+        f"status: {status or ('FAILED' if error is not None else 'SUBMITTED')}",
         f"job_id: {job_id if job_id is not None else '-'}",
         f"returncode: {result.returncode}",
         "",

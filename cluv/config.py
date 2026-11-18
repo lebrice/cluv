@@ -103,6 +103,15 @@ class LocalConfig:
     """
 
 
+class SubmitPolicy(BaseModel):
+    """Optional project constraints on candidate clusters and allocations."""
+
+    model_config = ConfigDict(extra="forbid")
+    eligible_clusters: list[str] | None = None
+    eligible_accounts: list[str] | None = None
+    exclude_accounts: list[str] = []
+
+
 class CluvConfig(BaseModel):
     """Configuration options for Cluv, loaded from the pyproject.toml file."""
 
@@ -116,6 +125,14 @@ class CluvConfig(BaseModel):
 
     env: dict[str, str] = {}
     """Global environment variables set on all clusters when running Slurm commands."""
+
+    submit: SubmitPolicy = SubmitPolicy()
+
+    datasets_rsync_filter: str | None = None
+    """Controller-local rsync merge rules; unresolved/missing files fail before preparation."""
+
+    manage_uv: bool = True
+    """Install/update uv normally; false uses and validates the configured target environment."""
 
     sbatch_args: SbatchArgs = {}
     """Global sbatch flags applied on all clusters.

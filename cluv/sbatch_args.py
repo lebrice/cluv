@@ -1,6 +1,6 @@
 import argparse
 
-SbatchArgs = dict[str, str | int | float | bool]
+SbatchArgs = dict[str, str | int | float | bool | list[dict]]
 """A set of sbatch flags, as a mapping from flag name to value."""
 
 
@@ -27,6 +27,8 @@ def sbatch_args_to_list(sbatch_args: SbatchArgs) -> list[str]:
     """
     flags: list[str] = []
     for key, value in sbatch_args.items():
+        if key == "__het_components__":
+            continue
         if value == "" or value is False:
             continue
         is_short_flag = len(key) == 1
@@ -37,6 +39,8 @@ def sbatch_args_to_list(sbatch_args: SbatchArgs) -> list[str]:
                 flags.extend([f"-{key}", str(value)])
             else:
                 flags.append(f"--{key}={value}")
+    for component in sbatch_args.get("__het_components__", []):
+        flags.extend([":", *sbatch_args_to_list(component)])
     return flags
 
 
@@ -63,6 +67,16 @@ def sbatch_args_from_list(sbatch_args_list: list[str]) -> SbatchArgs:
     >>> sbatch_args_from_list(["--array=0-3%2", "-a=0-1%1"])
     {'array': '0-3%2', 'a': '0-1%1'}
     """
+    if ":" in sbatch_args_list:
+        components: list[list[str]] = [[]]
+        for flag in sbatch_args_list:
+            if flag == ":":
+                components.append([])
+            else:
+                components[-1].append(flag)
+        parsed = sbatch_args_from_list(components[0])
+        parsed["__het_components__"] = [sbatch_args_from_list(c) for c in components[1:]]
+        return parsed
     # Parse known args with argparse to handle common aliases and defaults, and leave the rest in `unknown`.
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("-c", "--cpus-per-task", dest="cpus-per-task", default=argparse.SUPPRESS)

@@ -706,7 +706,8 @@ class TestJobScriptOverridesConfig:
         )
         assert len(submissions) == 1
         command = submissions[0].sbatch_command
-        assert "$HOME/my_project/scripts/passed_job.sh" in command
+        assert "scripts/passed_job.sh" in command
+        assert f'"--chdir={project_dir}"' in command
         assert "config_job" not in command
 
     async def test_passed_script_wins_over_per_cluster_config_default(
@@ -729,7 +730,8 @@ class TestJobScriptOverridesConfig:
         )
         assert len(submissions) == 1
         command = submissions[0].sbatch_command
-        assert "$HOME/my_project/scripts/passed_job.sh" in command
+        assert "scripts/passed_job.sh" in command
+        assert f'"--chdir={project_dir}"' in command
         assert "rorqual_job" not in command
 
     async def test_config_default_is_used_when_no_script_is_passed(
@@ -827,6 +829,9 @@ class TestSubmitCliParsing:
                 "vram": None,
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": False,
                 "test_only": False,
             }
@@ -863,6 +868,9 @@ class TestSubmitCliParsing:
                 "vram": None,
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": False,
                 "test_only": False,
             }
@@ -886,6 +894,9 @@ class TestSubmitCliParsing:
                 "vram": "10GB",
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": False,
                 "test_only": False,
             }
@@ -914,6 +925,9 @@ class TestSubmitCliParsing:
                 "vram": None,
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": False,
                 "test_only": False,
             }
@@ -937,6 +951,9 @@ class TestSubmitCliParsing:
                 "vram": None,
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": True,
                 "test_only": False,
             }
@@ -965,6 +982,9 @@ class TestSubmitCliParsing:
                 "vram": None,
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": False,
                 "test_only": False,
             }
@@ -992,6 +1012,9 @@ class TestSubmitCliParsing:
                 "vram": None,
                 "sync_datasets": True,
                 "fetch_results": True,
+                "eligible_clusters": None,
+                "eligible_accounts": None,
+                "exclude_accounts": None,
                 "parsable": False,
                 "test_only": False,
             }
@@ -1639,7 +1662,7 @@ async def test_submit_races_the_allocations_of_a_cluster(
         "account": "def-bengioy",
         "job-name": "cluv-job",
         "output": "results/narval_%j/slurm-%j.out",
-        "chdir": "$HOME/my_project",
+        "chdir": str(project_dir),
         "export": "ALL",
     }
     assert cancelled == [rrg_job_id]

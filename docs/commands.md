@@ -144,6 +144,11 @@ cluv sync [clusters] [--sync-datasets | --no-sync-datasets]
 :   Push/pull datasets from `data_source` to each cluster as part of the sync.
     Requires `data_source` to be set in the config. Enabled by default.
 
+`--fetch-results`, `--no-fetch-results`
+:   Fetch previous run results/checkpoints during synchronization (default enabled).
+    Use `--no-fetch-results` to prepare code, required inputs and runtime without
+    copying old checkpoints back to the controller.
+
 ---
 
 ## [`cluv submit`](#cluv-submit)
@@ -223,6 +228,24 @@ cluv submit <cluster> [<job.sh>] [options] [sbatch-args...] [-- program-args...]
 `--parsable`
 :   Print only the job ID (or `<cluster>:<job_id>` when `cluster` is `first`) on stdout, for use in
     scripts. Everything else (logs, the live jobs table) is silenced, as with `--quiet`.
+
+`--eligible-clusters=LIST`, `--eligible-accounts=LIST`
+:   Comma-separated approved clusters (for `first`) and configured allocation accounts.
+    Override `[tool.cluv.submit].eligible_clusters` and `.eligible_accounts` lists.
+    Explicitly empty selections fail; unknown clusters fail before connection or sync.
+    Other connected clusters and unselected account variants are not submitted.
+
+`--exclude-accounts=PATTERNS`
+:   Comma-separated account globs added to `[tool.cluv.submit].exclude_accounts`.
+    Exclusions apply to every heterogeneous component and cannot be cleared by an
+    eligibility override. For example, a project can exclude `cc-debug*` accounts.
+
+Heterogeneous `:` overrides retain distinct per-component resources. Without `:`,
+common CLI options and configured account/time defaults apply to every header
+component. Heterogeneous jobs are sent through the original `sbatch` command using
+an in-memory header and the canonical script body on `/dev/stdin`, preserving
+program arguments. No site filter is bypassed. `--vram` and `--chunking` require
+non-heterogeneous jobs; use explicit GPU requests and time limits for each role.
 
 `--test-only`
 :   Submit nothing. Run `sbatch --test-only` for every job configuration `cluv submit` would have

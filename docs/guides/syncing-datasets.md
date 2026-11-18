@@ -1,5 +1,55 @@
 # Syncing datasets across clusters
 
+## Portable tool bundles and selective inputs
+
+Remote data sources pass through a controller-local mirror. Keep
+`data_source = "mila:/absolute/source/root"` authoritative, and bound the mirror
+with reviewed filters and a capacity check. An existing controller running on
+the source host instead uses that actual path and skips self-copy. Target paths
+remain per-cluster `datasets_path`; this is not a direct remote-to-remote service.
+
+```toml
+[tool.cluv]
+data_source = "mila:/absolute/source/root"
+datasets_path = "$SCRATCH/datasets/project"
+datasets_rsync_filter = "$HOME/.cache/project/portable-sync-filter.rules"
+manage_uv = false
+
+[tool.cluv.local.env]
+SCRATCH = "$HOME/.cache/project"
+```
+
+`datasets_rsync_filter` is a controller-local rsync merge-rules file, applied to
+both pull and push. Use reviewed allow rules and a final exclusion rule to select
+only required models/data/runtime/manifests; otherwise ordinary dataset sync copies
+the whole root. Validate the selected files and symlink closure independently.
+Filtered pushes run rsync even when the source root mtime is unchanged, since nested
+files or filter contents may have changed. Missing/unresolved filters fail before
+preparation. No delete or whole-root mirror is implied.
+
+The existing `local.env` applies only off-cluster: the example resolves the
+desktop mirror under `$HOME/.cache/project/datasets/project`, while remote
+`$SCRATCH` paths still expand in each target login shell. It does not change
+`HOME` or export the controller's `SCRATCH` to targets. An unresolved controller
+path fails before git push or transfer. A local-current-cluster submission uses
+the controller's actual checkout for shell cwd, Slurm `--chdir` and script lookup,
+so an older configured remote checkout is left untouched.
+
+With `manage_uv = false`, selective data is copied before validating `uv` through
+the configured target environment. cluv never installs or self-updates site uv.
+Configure the staged tool's `PATH`, `UV_PYTHON`, `UV_CACHE_DIR` and offline settings
+in the cluster environment; that exact environment is also used for `uv sync`.
+Variables expand in the target login shell, not on the controller. The default
+`manage_uv = true` retains the ordinary installer and login-node cache-warming
+behavior. A staged bundle still needs real per-target relocation/runtime validation
+before a GPU race; local fake-endpoint tests do not establish that readiness.
+
+Use `cluv sync --no-fetch-results <cluster> ...` to prepare selected inputs and
+runtime without copying old result/checkpoint trees back to the controller.
+The default still fetches results. After reviewed preparation and per-target
+validation, `cluv submit first --no-sync-datasets --no-fetch-results -- ...`
+keeps the ordinary race while avoiding redundant data and result transfers.
+
 [`cluv sync`](../commands.md#cluv-sync) can also replicate datasets to every cluster listed in your Cluv config.
 
 ## Configure dataset sync in `pyproject.toml`

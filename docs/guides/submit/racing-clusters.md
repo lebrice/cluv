@@ -33,6 +33,45 @@ configurations races four jobs at once.
 
 ## How the race works
 
+For a reviewed subset of ready clusters and ordinary allocations, constrain the
+existing race rather than including every connection:
+
+```toml
+[tool.cluv.submit]
+eligible_clusters = ["fir", "rorqual"]
+eligible_accounts = ["def-example_gpu", "rrg-example_gpu"]
+exclude_accounts = ["cc-debug*"]
+```
+
+CLI `--eligible-clusters=fir,rorqual` and `--eligible-accounts=...` override the
+corresponding selections; `--exclude-accounts=...` adds exclusions. Unset policy
+keeps the ordinary connected-cluster behavior. Establish and verify target access,
+runtime/assets, canonical headers and application paths before racing.
+
+For heterogeneous jobs, every expected component must be reported running (or all
+completed) to count as started. This proves scheduler allocation, not application
+readiness. Polling can allow transient duplicate setup/training before cancellation;
+there is no application-start barrier. The leader ID is cancelled, then every
+expected component must be terminal. Cancellation has a 60-second overall deadline
+and fails visibly with unresolved IDs/states instead of reporting success. Do not
+start another expensive race while loser cancellation remains unconfirmed.
+
+Preparation runs once per cluster before account variants are submitted. Known
+shared-filesystem aliases serialize checkout/runtime preparation; independent
+queued job lifetimes remain concurrent. In-flight `sbatch` requests are allowed to
+return their IDs before loser cleanup, so they cannot become untracked allocations.
+
+`cluv submit first --help` is safe and stops before preparation. A `--help` after
+the program-argument separator `--` is forwarded to the program.
+
+Submission receipts retain raw stdout/stderr/status before parsing. One unambiguous
+final parsable line (`jobid` or `jobid;cluster`) is accepted even after site notices.
+Ambiguous output, transport failure or the 60-second submission timeout aborts the
+race visibly. All confirmed sibling IDs are retained and cleaned up, including an
+otherwise winning job. An unknown ID requires manual reconciliation from the raw
+receipts; cluv does not guess IDs, cancel unrelated jobs or automatically retry.
+Polling and cancellation failures likewise do not report a successful race.
+
 The race between clusters is implemented in three steps:
 
 1. cluv builds a submission for every connected cluster (and every job configuration on each), and

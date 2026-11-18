@@ -30,7 +30,9 @@ def test_cli_passes_extras_to_sync(
 ):
     monkeypatch.setattr(cluv.__main__, "sync", mock_sync := mock.AsyncMock())
     cluv.__main__.main(["sync", "mila", *argv])
-    mock_sync.assert_awaited_once_with(clusters=["mila"], sync_datasets=True, **expected_kwargs)
+    mock_sync.assert_awaited_once_with(
+        clusters=["mila"], sync_datasets=True, fetch_results=True, **expected_kwargs
+    )
 
 
 def test_cli_extra_and_all_extras_are_mutually_exclusive(monkeypatch: pytest.MonkeyPatch):

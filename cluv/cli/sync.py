@@ -48,6 +48,7 @@ async def sync(
     sync_datasets: bool = True,
     extras: list[str] | None = None,
     all_extras: bool = False,
+    fetch_results: bool = True,
 ) -> list[Remote]:
     """Synchronizes the current project across clusters.
 
@@ -111,7 +112,11 @@ async def sync(
     await asyncio.gather(
         *(
             sync_per_cluster_part(
-                remote, sync_datasets=sync_datasets, extras=extras, all_extras=all_extras
+                remote,
+                sync_datasets=sync_datasets,
+                extras=extras,
+                all_extras=all_extras,
+                sync_results=fetch_results,
             )
             for remote in remotes_to_sync
         )
@@ -228,6 +233,17 @@ async def sync_common_part(remotes: list[Remote], sync_datasets: bool = True) ->
     needed.
     """
     config = get_cluv_config()
+    if sync_datasets and config.data_source:
+        dataset_filter_args(
+            config
+        )  # Validate small controller-side inputs before git/network mutation.
+        source, separator, _ = config.data_source.partition(":")
+        if separator and source != current_cluster():
+            local_path = get_datasets_path()
+            if local_path is None or "$" in str(local_path):
+                raise RuntimeError(
+                    f"Controller datasets_path is unresolved; run cluv on data source {source} to avoid a desktop mirror, or explicitly configure a local mirror"
+                )
     await run_git_push_if_needed()
     if sync_datasets:
         await pull_datasets_if_needed(current_cluster(), config, remotes)
@@ -261,11 +277,22 @@ async def sync_per_cluster_part(
     def _save():
         save_project_state(cluster, project_state)
 
-    await install_uv(remote, project_state)
-    _save()
+    if not config.manage_uv:
+        if sync_datasets and config.data_source:
+            await push_datasets_if_needed(remote, config, project_state)
+            _save()
+    else:
+        await install_uv(remote, project_state)
+        _save()
 
     await clone_project(remote, project_path=project_path, project_state=project_state)
     _save()
+
+    if not config.manage_uv:
+        prefix = target_environment(cluster_config.env)
+        await remote.get_output(
+            f"bash --login -c {shlex.quote(prefix + 'command -v uv && uv --version')}", hide=True
+        )
 
     await run_uv_sync(
         remote,
@@ -274,6 +301,7 @@ async def sync_per_cluster_part(
         uv_cache_dir=cluster_config.env.get("UV_CACHE_DIR"),
         extras=extras,
         all_extras=all_extras,
+        env_vars=cluster_config.env if not config.manage_uv else None,
     )
     _save()
 
@@ -298,24 +326,49 @@ async def sync_per_cluster_part(
         for run_path in new_runs:
             console.print(f"  {run_path}")
 
-    if sync_datasets and config.data_source:
-        here = current_cluster()
-        if ":" not in config.data_source:
-            # data_source is a local path; use it directly as the source.
-            # Note: this tool targets POSIX (Linux/macOS) systems only; Windows drive-letter
-            # paths (e.g. C:\...) are not supported.
-            local_dataset_path = Path(os.path.expandvars(config.data_source))
-        else:
-            local_dataset_path = (
-                config.get_cluster_config(here) if here else config
-            ).datasets_path
-            if not local_dataset_path:
-                raise RuntimeError("data_source is set, so datasets_path should also be set!")
-            local_dataset_path = Path(os.path.expandvars(str(local_dataset_path)))
-        await _push_datasets_to_remote(local_dataset_path, remote, config, project_state)
+    if sync_datasets and config.data_source and config.manage_uv:
+        await push_datasets_if_needed(remote, config, project_state)
         _save()
 
     return new_runs
+
+
+def dataset_filter_args(config: CluvConfig) -> list[str]:
+    if config.datasets_rsync_filter is None:
+        return []
+    path = Path(os.path.expandvars(config.datasets_rsync_filter))
+    if "$" in str(path) or not path.is_file():
+        raise RuntimeError(
+            f"Missing/unresolved controller rsync filter {path}; stage the reviewed small filter on this controller before preparation"
+        )
+    return ["--filter", f"merge {path.resolve()}"]
+
+
+async def push_datasets_if_needed(remote, config, project_state):
+    here = current_cluster()
+    if remote.hostname == here:
+        return
+    if ":" not in config.data_source:
+        # data_source is a local path; use it directly as the source.
+        # Note: this tool targets POSIX (Linux/macOS) systems only; Windows drive-letter
+        # paths (e.g. C:\...) are not supported.
+        local_dataset_path = Path(os.path.expandvars(config.data_source))
+    else:
+        source_host, _, source_path = config.data_source.partition(":")
+        if remote.hostname == source_host:
+            return  # A desktop mirror must never overwrite its authoritative source.
+        local_dataset_path = (
+            source_path
+            if source_host == here
+            else (config.get_cluster_config(here) if here else config).datasets_path
+        )
+        if not local_dataset_path:
+            raise RuntimeError("data_source is set, so datasets_path should also be set!")
+        local_dataset_path = Path(os.path.expandvars(str(local_dataset_path)))
+    if "$" in str(local_dataset_path):
+        raise RuntimeError("Unresolved controller source path; run cluv on the data source host")
+    if remote.hostname != here:
+        await _push_datasets_to_remote(local_dataset_path, remote, config, project_state)
 
 
 async def get_project_path_on_cluster(remote: Remote) -> PurePosixPath:
@@ -379,6 +432,7 @@ async def run_uv_sync(
     uv_cache_dir: str | None = None,
     extras: list[str] | None = None,
     all_extras: bool = False,
+    env_vars: dict[str, str] | None = None,
 ):
     current_git_commit = subprocess.getoutput("git rev-parse HEAD").strip()
     extras_flags = _uv_sync_extras_flags(extras, all_extras)
@@ -404,7 +458,11 @@ async def run_uv_sync(
     # as a single `bash --login -c '...'` command sent directly over SSH, with no intermediate shell
     # hop, so a value containing e.g. `$SCRATCH` is expanded correctly by this same login shell -
     # quoting it would instead pass the literal, unexpanded string through.
-    env_prefix = f"UV_CACHE_DIR={uv_cache_dir} " if uv_cache_dir else ""
+    env_prefix = (
+        target_environment(env_vars)
+        if env_vars is not None
+        else (f"UV_CACHE_DIR={uv_cache_dir} " if uv_cache_dir else "")
+    )
     # --reinstall: without a custom UV_CACHE_DIR, this `uv sync` also builds the venv the login node
     # itself would use, so a plain `uv sync` is enough - it downloads (and thereby caches) whatever
     # the venv doesn't already have. With a custom UV_CACHE_DIR, though, the *job* builds its own
@@ -414,12 +472,23 @@ async def run_uv_sync(
     # empty. --reinstall forces every package through cache/download regardless, so the directory
     # the job will actually read from gets populated either way.
     reinstall_flag = " --reinstall" if uv_cache_dir else ""
-    await remote.run(
-        f"bash --login -c '{env_prefix}uv --directory={project_path} sync --quiet"
-        f"{reinstall_flag}{extras_flags}'"
+    command = (
+        f"{env_prefix}uv --directory={project_path} sync --quiet{reinstall_flag}{extras_flags}"
     )
+    await remote.run(f"bash --login -c {shlex.quote(command)}")
     project_state.last_uv_sync_git_commit = current_git_commit
     project_state.last_uv_sync_extras_flags = extras_flags
+
+
+def target_environment(values: dict[str, str]) -> str:
+    # Share the job submission's validation and target-shell expansion contract.
+    from cluv.cli.submit import check_path_is_safe_to_interpolate
+
+    for key, value in values.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError(f"Invalid environment name: {key}")
+        check_path_is_safe_to_interpolate(value, key)
+    return "".join(f"export {key}={value}; " for key, value in values.items())
 
 
 # Extra names as allowed by PEP 508 / the packaging spec. Checking this (rather than shell-quoting)
@@ -739,6 +808,7 @@ async def _pull_datasets(source_remote: Remote, source_path: str, local_datasets
             # store lives in `.git.bak`. For ImageNet that is a second, 145GB copy of the
             # very archives we are already copying.
             "--exclude=.git.bak",
+            *dataset_filter_args(get_cluv_config()),
             f"{source_host}:{source_path}/",
             f"{local_datasets_path}/",
         ),
@@ -754,8 +824,10 @@ async def _push_datasets_to_remote(
 
     # Skip if we pushed after the last edit to the local source path.
     if (
-        last_push_datasets_time := project_state.last_pushed_datasets
-    ) and last_push_datasets_time > last_datasets_dir_edit_time:
+        not config.datasets_rsync_filter
+        and (last_push_datasets_time := project_state.last_pushed_datasets)
+        and last_push_datasets_time > last_datasets_dir_edit_time
+    ):
         logger.info(
             f"Datasets at {local_source} were already pushed to {remote.hostname} and have not "
             f"changed since. Skipping."
@@ -784,6 +856,7 @@ async def _push_datasets_to_remote(
             # store lives in `.git.bak`. For ImageNet that is a second, 145GB copy of the
             # very archives we are already copying.
             "--exclude=.git.bak",
+            *dataset_filter_args(config),
             f"{local_source}/",
             f"{remote.hostname}:{resolved_path}/",
         ),

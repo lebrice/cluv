@@ -88,6 +88,11 @@ def main(argv: list[str] | None = None) -> None:
 
     submit_parser = add_submit_args(subparsers)
     _add_v_arg(submit_parser)
+    # REMAINDER swallows help after the positional cluster/script. Handle it
+    # before dispatch, but never interpret program arguments after '--' as cluv help.
+    if "submit" in argv and any(a in ("--help", "-h") for a in argv[argv.index("submit") + 1 :]):
+        submit_parser.print_help()
+        return
 
     status_parser = add_status_args(subparsers)
     _add_v_arg(status_parser)
@@ -141,9 +146,14 @@ def main(argv: list[str] | None = None) -> None:
             if action is None:
                 continue
             remaining_sbatch_args = []
-            for arg in args_dict["sbatch_args"]:
+            arguments = iter(args_dict["sbatch_args"])
+            for arg in arguments:
                 name, _, value = arg.partition("=")
                 if name == f"--{dashed}":
+                    if not value and action.nargs != "?":
+                        value = next(arguments, "")
+                        if not value or value.startswith("-"):
+                            submit_parser.error(f"{name} requires a value")
                     args_dict[flag] = (
                         action.type(value) if value and action.type else value or action.const
                     )
@@ -181,6 +191,18 @@ def add_submit_args(subparsers: Subparsers):
         help="Submit a SLURM job on a remote cluster.",
         formatter_class=rich_argparse.RichHelpFormatter,
         usage="cluv submit <cluster> [<job.sh>] [sbatch-args...] [-- program-args...]",
+    )
+    submit_parser.add_argument(
+        "--eligible-clusters",
+        help="Comma-separated approved clusters for submit first; never adds other connected clusters.",
+    )
+    submit_parser.add_argument(
+        "--eligible-accounts",
+        help="Comma-separated approved configured accounts.",
+    )
+    submit_parser.add_argument(
+        "--exclude-accounts",
+        help="Comma-separated account glob exclusions, added to project submit policy.",
     )
     submit_parser.add_argument(
         "cluster",
@@ -326,6 +348,12 @@ def add_sync_args(subparsers: Subparsers):
         help="Push datasets from data_source to each cluster. Requires data_source in config.",
     )
     extras_group = sync_parser.add_mutually_exclusive_group()
+    sync_parser.add_argument(
+        "--fetch-results",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch existing results; --no-fetch-results prepares inputs/runtime without old checkpoints.",
+    )
     extras_group.add_argument(
         "--extra",
         dest="extras",
