@@ -174,6 +174,9 @@ cluv submit <cluster> [<job.sh>] [options] [sbatch-args...] [-- program-args...]
     others are automatically cancelled. The same happens when the target cluster has
     [more than one job configuration](guides/submit/config.md#multiple-job-configurations-on-the-same-cluster)
     configured: one job is submitted per configuration, and only the first one to start is kept.
+    Read timeouts mark that cluster `UNKNOWN` while fresh healthy queues continue. Three
+    consecutive failed polls warn explicitly; if all relevant clusters reach that bound,
+    the race fails through strict known-job cleanup. Parser/identity errors remain fatal.
 
 `job.sh`
 :   Path to the sbatch job script, relative to the project root. Defaults to the job script

@@ -71,6 +71,46 @@ raise_on_command_error = ContextVar("raise_on_command_error", default=False)
 
 JobState = str
 SUBMIT_TIMEOUT_SECONDS = 60
+STATUS_READ_FAILURE_WARNING_POLLS = 3
+
+
+def recoverable_status_read_error(error: BaseException) -> bool:
+    """Retry only identified read timeouts/transport losses, never parser or identity errors."""
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(error, subprocess.CalledProcessError) and error.returncode == 255:
+        command = error.cmd
+        stderr = str(error.stderr).lower()
+        # Proxy errors can append "connection closed" to a fatal authentication
+        # or host-key error. Identity failures take precedence over transport text.
+        if any(
+            message in stderr
+            for message in (
+                "permission denied",
+                "authentication",
+                "host key",
+                "hostkey",
+                "host identification has changed",
+                "signing failed",
+                "agent refused operation",
+            )
+        ):
+            return False
+        return (
+            isinstance(command, (list, tuple))
+            and bool(command)
+            and Path(str(command[0])).name == "ssh"
+            and any(
+                message in stderr
+                for message in (
+                    "connection reset",
+                    "connection closed",
+                    "connection timed out",
+                    "broken pipe",
+                )
+            )
+        )
+    return False
 
 
 class ClusterSyncFailed(Exception):
@@ -558,6 +598,8 @@ async def wait_for_first_running_job(
     }
     sync_and_submit = asyncio.gather(*cluster_tasks.values(), return_exceptions=True)
     delay = initial_delay
+    failed_status_reads: dict[str, int] = {}
+    last_status_errors: dict[str, str] = {}
     try:
         while True:
             fatal_errors = [
@@ -577,12 +619,31 @@ async def wait_for_first_running_job(
             submitted_everywhere = sync_and_submit.done()
             queued_jobs = [s for s in all_submissions if has_job(s)]
 
-            await asyncio.gather(
+            polled_clusters = group_by_cluster(queued_jobs)
+            status_results = await asyncio.gather(
                 *(
                     update_job_states_with_sacct(cluster_to_remote[cluster], cluster_jobs)
-                    for cluster, cluster_jobs in group_by_cluster(queued_jobs).items()
-                )
+                    for cluster, cluster_jobs in polled_clusters.items()
+                ),
+                return_exceptions=True,
             )
+            for (name, rows), result in zip(polled_clusters.items(), status_results):
+                if not isinstance(result, BaseException):
+                    failed_status_reads.pop(name, None)
+                    last_status_errors.pop(name, None)
+                    continue
+                if not recoverable_status_read_error(result):
+                    raise result
+                # A failed read cannot turn a previous RUNNING observation into a fresh winner.
+                for row in rows:
+                    row.state = "UNKNOWN"
+                count = failed_status_reads[name] = failed_status_reads.get(name, 0) + 1
+                last_status_errors[name] = f"{type(result).__name__}: {result}"
+                level = "DEGRADED" if count >= STATUS_READ_FAILURE_WARNING_POLLS else "Retrying"
+                console.log(
+                    f"{level} status read on {name}, job IDs {[row.job_id for row in rows]}, "
+                    f"consecutive failures {count}: {last_status_errors[name]}"
+                )
             logger.debug("Job states: %s", {(j.cluster, j.job_id): j.state for j in queued_jobs})
 
             if started_jobs := (
@@ -592,6 +653,27 @@ async def wait_for_first_running_job(
                 found_running_job.set()
                 logger.debug(f"Found {len(started_jobs)} running (or completed) jobs.")
                 return started_jobs[0]
+
+            # A fresh healthy queue (including a possible requeue) keeps its place.
+            # State-only results cannot establish that PREEMPTED/NODE_FAIL is final.
+            relevant_clusters = {
+                name
+                for name, rows in polled_clusters.items()
+                if any(
+                    row.state not in TERMINAL_JOB_STATES
+                    or row.state in {"PREEMPTED", "NODE_FAIL", "BOOT_FAIL"}
+                    for row in rows
+                )
+            }
+            if relevant_clusters and all(
+                failed_status_reads.get(name, 0) >= STATUS_READ_FAILURE_WARNING_POLLS
+                for name in relevant_clusters
+            ):
+                raise RuntimeError(
+                    "Status reads unavailable for all remaining candidate clusters after "
+                    f"{STATUS_READ_FAILURE_WARNING_POLLS} consecutive failed polls: "
+                    + repr({name: last_status_errors[name] for name in sorted(relevant_clusters)})
+                )
 
             if submitted_everywhere:
                 if all(

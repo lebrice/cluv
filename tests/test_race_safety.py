@@ -593,9 +593,9 @@ async def test_race_failure_cleans_all_known_siblings_without_reporting_success(
                 raise RuntimeError("cleanup denied")
             output = ""
         else:
-            if failure == "poll" and not polled:
+            if failure == "poll" and not cancelled:
                 polled = True
-                raise ConnectionError("poll failed")
+                raise TimeoutError("persistent read timeout")
             ids = command.split("sacct -j ")[1].split()[0].split(",")
             output = "\n".join(
                 f"{value}|{'CANCELLED' if int(value) in cancelled and failure != 'cleanup' else 'RUNNING'}"
@@ -614,7 +614,7 @@ async def test_race_failure_cleans_all_known_siblings_without_reporting_success(
     monkeypatch.setattr(
         dispatch, "save_job", lambda _: pytest.fail("Must not report/save race success")
     )
-    with pytest.raises((ExceptionGroup, ConnectionError)) as error:
+    with pytest.raises((ExceptionGroup, RuntimeError)) as error:
         await submit("fir", script, [], [], _skip_sync=True)
     assert 200 in cancelled
     if failure == "poll":

@@ -63,6 +63,16 @@ conflicting or still-running components do not become terminal by inference.
 Slurm queries and cancellation run in login shells so site-provided command paths
 are available. Controller-query failures remain visible within bounded cleanup.
 
+Read timeouts and identified SSH connection losses are isolated to that cluster's
+current observations, which become `UNKNOWN`; an earlier `RUNNING` state is never
+reused as a fresh winner. Three consecutive failed polls produce a `DEGRADED`
+warning naming the cluster and job IDs. Fresh healthy queues keep their place, and
+a fresh whole-allocation winner is considered first. If all remaining relevant
+clusters fail three consecutive polls, the race fails visibly and uses the existing
+strict cleanup of known IDs. Parser/identity errors and user cancellation are not
+retried. States are queried again rather than cached as final, preserving requeue
+observations. Loser cancellation confirmation retains its separate bounded deadline.
+
 Preparation runs once per cluster before account variants are submitted. Known
 shared-filesystem aliases serialize checkout/runtime preparation; independent
 queued job lifetimes remain concurrent. In-flight `sbatch` requests are allowed to
@@ -77,7 +87,7 @@ Ambiguous output, transport failure or the 60-second submission timeout aborts t
 race visibly. All confirmed sibling IDs are retained and cleaned up, including an
 otherwise winning job. An unknown ID requires manual reconciliation from the raw
 receipts; cluv does not guess IDs, cancel unrelated jobs or automatically retry.
-Polling and cancellation failures likewise do not report a successful race.
+Unconfirmed cancellation likewise does not report a successful race.
 
 The race between clusters is implemented in three steps:
 
