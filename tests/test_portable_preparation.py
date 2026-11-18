@@ -1,4 +1,4 @@
-"""Exercise selective rsync and staged uv locally; all remote endpoints are fakes."""
+"""Exercise selective rsync and managed uv preparation locally; all remote endpoints are fakes."""
 
 import importlib
 import os
@@ -86,16 +86,25 @@ def test_sync_cli_forwards_result_fetch_policy_to_preparation(monkeypatch, fetch
 
 
 @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync required")
-async def test_mila_controller_selective_data_precedes_portable_uv_without_site_update(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("sync_datasets", [True, False])
+async def test_managed_uv_preparation_preserves_target_python_and_cache(
+    tmp_path, monkeypatch, sync_datasets
 ):
     source, target = tmp_path / "source", tmp_path / "target"
-    uv = source / "runtime/uv/bin/uv"
+    uv = target / "managed-bin/uv"
     uv.parent.mkdir(parents=True)
     uv.write_text(
-        '#!/bin/sh\nif [ "$1" = --version ]; then echo "uv 0.13.8"; else printf "%s\\n" "$UV_PYTHON" "$UV_CACHE_DIR" "$UV_OFFLINE" > "$SCRATCH/uv-sync-env"; fi\n'
+        '#!/bin/sh\nif [ "$1" = --version ]; then echo "uv 0.13.8"; else printf "%s\\n" "$UV_PYTHON" "$UV_PYTHON_INSTALL_DIR" "$UV_CACHE_DIR" "${UV_OFFLINE:-online}" > "$SCRATCH/uv-sync-env"; fi\n'
     )
     uv.chmod(0o755)
+    python = source / "runtime/python/bin/python3.12"
+    python.parent.mkdir(parents=True)
+    python.write_text("staged interpreter")
+    cache = source / "runtime/cache/wheel"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("cached package")
+    if not sync_datasets:
+        shutil.copytree(source / "runtime", target / "runtime")
     (source / "models/Qwen3-0.6B").mkdir(parents=True)
     (source / "models/Qwen3-0.6B/weight").write_text("required weight")
     (source / "robot-checkpoints").mkdir()
@@ -106,11 +115,10 @@ async def test_mila_controller_selective_data_precedes_portable_uv_without_site_
         results_path=str(target / "results"),
         data_source=f"mila:{source}",
         datasets_path=str(target),
-        manage_uv=False,
         datasets_rsync_filter=str(rules),
         env={
-            "PATH": "$SCRATCH/runtime/uv/bin:$PATH",
             "UV_PYTHON": "$SCRATCH/runtime/python/bin/python3.12",
+            "UV_PYTHON_INSTALL_DIR": "$SCRATCH/runtime/python",
             "UV_CACHE_DIR": "$SCRATCH/runtime/cache",
             "UV_OFFLINE": "1",
         },
@@ -123,13 +131,12 @@ async def test_mila_controller_selective_data_precedes_portable_uv_without_site_
     monkeypatch.setattr(sync, "current_cluster", lambda: "mila")
     monkeypatch.setattr(sync, "read_cache", lambda: SimpleNamespace(project_states={}))
     monkeypatch.setattr(sync, "save_project_state", lambda *_: None)
-    installer = AsyncMock(side_effect=AssertionError("Never install/update site uv"))
+    order = []
+    installer = AsyncMock(side_effect=lambda *_: order.append("install-uv"))
     monkeypatch.setattr(sync, "install_uv", installer)
     monkeypatch.setattr(sync, "create_results_dir_with_symlink_to_scratch", AsyncMock())
-    order = []
 
     async def clone(*args, **kwargs):
-        assert (target / "runtime/uv/bin/uv").is_file()
         assert not (target / "robot-checkpoints").exists()
         order.append("clone")
 
@@ -144,35 +151,84 @@ async def test_mila_controller_selective_data_precedes_portable_uv_without_site_
         return result
 
     monkeypatch.setattr(sync, "run", run)
+    monkeypatch.delenv("UV_OFFLINE", raising=False)
     target_env = dict(os.environ, SCRATCH=str(target))
 
     class Remote:
         hostname = "fir"
 
         async def run(self, command, **kwargs):
+            if command.startswith("mkdir -p "):
+                return subprocess.run(shlex.split(command), check=True)
+            assert (target / python.relative_to(source)).read_text() == "staged interpreter"
+            assert (target / cache.relative_to(source)).read_text() == "cached package"
+            assert "--reinstall" in command
             result = subprocess.run(
-                command, shell=True, env=target_env, capture_output=True, text=True, check=True
+                [
+                    "bash",
+                    "--login",
+                    "-c",
+                    f"export PATH={uv.parent}:$PATH; " + shlex.split(command)[-1],
+                ],
+                env=target_env,
+                capture_output=True,
+                text=True,
+                check=True,
             )
             if " sync --quiet" in command:
                 order.append("uv-sync")
             return result
 
-        async def get_output(self, command, **kwargs):
-            result = await self.run(command, **kwargs)
-            if "command -v uv" in command:
-                assert str(target / "runtime/uv/bin/uv") in result.stdout
-                order.append("validate-uv")
-            return result.stdout.strip()
-
-    await sync.sync_per_cluster_part(Remote(), sync_results=False)
-    assert order == ["data", "clone", "validate-uv", "uv-sync"]
+    await sync.sync_per_cluster_part(Remote(), sync_results=False, sync_datasets=sync_datasets)
+    assert order == ["install-uv", "clone", *(["data"] if sync_datasets else []), "uv-sync"]
     assert (target / "uv-sync-env").read_text().splitlines() == [
         str(target / "runtime/python/bin/python3.12"),
+        str(target / "runtime/python"),
         str(target / "runtime/cache"),
-        "1",
+        "online",
     ]
-    assert (target / "models/Qwen3-0.6B/weight").read_text() == "required weight"
-    installer.assert_not_called()
+    if sync_datasets:
+        assert (target / "models/Qwen3-0.6B/weight").read_text() == "required weight"
+    else:
+        assert not (target / "models").exists()
+    installer.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("remote_version", "cached_version", "expected_update"),
+    [
+        (None, None, True),
+        ("0.12.0", "0.12.0", True),
+        ("0.13.8", None, False),
+        ("0.13.8", "0.13.8", False),
+    ],
+)
+async def test_install_uv_matches_controller_version(
+    monkeypatch, remote_version, cached_version, expected_update
+):
+    monkeypatch.setattr(sync.shutil, "which", lambda _: "/controller/bin/uv")
+    monkeypatch.setattr(sync.subprocess, "getoutput", lambda _: "uv 0.13.8 (linux-x86_64)")
+    remote = SimpleNamespace(
+        hostname="fir",
+        get_output=AsyncMock(
+            side_effect=[
+                "/target/bin/uv" if remote_version else "",
+                f"uv {remote_version or '0.14.0'} (linux-x86_64)",
+            ]
+        ),
+        run=AsyncMock(),
+    )
+    state = ProjectStateOnCluster(uv_version=cached_version)
+    await sync.install_uv(remote, state)
+    assert state.uv_version == "0.13.8"
+    commands = [call.args[0] for call in remote.run.await_args_list]
+    assert ("curl -LsSf https://astral.sh/uv/install.sh | sh" in commands) == (
+        remote_version is None
+    )
+    assert ("bash -l -c 'uv self update 0.13.8'" in commands) == expected_update
+    if cached_version == "0.13.8":
+        remote.get_output.assert_not_awaited()
+        remote.run.assert_not_awaited()
 
 
 @pytest.mark.parametrize("problem", ["filter", "scratch"])
@@ -369,12 +425,10 @@ results_path = "$SCRATCH/results"
 data_source = "mila:/authoritative/source"
 datasets_path = "$SCRATCH/datasets/large-scale-jobs"
 datasets_rsync_filter = "$HOME/.cache/large-scale-jobs/portable-sync-filter.rules"
-manage_uv = false
 [tool.cluv.local.env]
 SCRATCH = "$HOME/.cache/large-scale-jobs"
 [tool.cluv.env]
 UV_PYTHON = "$SCRATCH/runtime/python/bin/python3.12"
-PATH = "$SCRATCH/runtime/uv/bin:$PATH"
 [tool.cluv.clusters.fir]
 """)
     cfg = load_cluv_config(project)

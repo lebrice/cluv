@@ -14,7 +14,6 @@ data_source = "mila:/absolute/source/root"
 datasets_path = "$SCRATCH/datasets/project"
 datasets_rsync_filter = "$HOME/.cache/project/portable-sync-filter.rules"
 datasets_copy_links = false
-manage_uv = false
 
 [tool.cluv.local.env]
 SCRATCH = "$HOME/.cache/project"
@@ -42,14 +41,15 @@ path fails before git push or transfer. A local-current-cluster submission uses
 the controller's actual checkout for shell cwd, Slurm `--chdir` and script lookup,
 so an older configured remote checkout is left untouched.
 
-With `manage_uv = false`, selective data is copied before validating `uv` through
-the configured target environment. cluv never installs or self-updates site uv.
-Configure the staged tool's `PATH`, `UV_PYTHON`, `UV_CACHE_DIR` and offline settings
-in the cluster environment; that exact environment is also used for `uv sync`.
-Variables expand in the target login shell, not on the controller. The default
-`manage_uv = true` retains the ordinary installer and login-node cache-warming
-behavior. A staged bundle still needs real per-target relocation/runtime validation
-before a GPU race; local fake-endpoint tests do not establish that readiness.
+Cluv installs or updates uv to match the controller's version on every target.
+Use that managed uv rather than placing a bundled uv ahead of it on `PATH`.
+Selected data is copied before `uv sync`, so staged interpreters and caches are
+available during preparation. Configure `UV_PYTHON`, `UV_PYTHON_INSTALL_DIR` and
+`UV_CACHE_DIR` in the cluster environment; these and other target variables expand
+in the target login shell, not on the controller. Job `UV_OFFLINE` settings are
+not forwarded to login-node `uv sync`, which retains normal online cache warming.
+A staged Python/cache bundle still needs real per-target relocation/runtime
+validation before a GPU race; local fake-endpoint tests do not establish readiness.
 
 Use `cluv sync --no-fetch-results <cluster> ...` to prepare selected inputs and
 runtime without copying old result/checkpoint trees back to the controller.

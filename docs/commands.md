@@ -121,9 +121,11 @@ cluv login [clusters]
 
 Synchronize the current project across clusters.
 
-This pushes local git commits, then on each remote cluster: clones the project (if needed),
-fetches and checks out the current commit, runs `uv sync`, and fetches back any new results
-via `rsync`.
+This pushes local git commits, then on each remote cluster: installs or updates uv to
+match the controller's version, clones the project (if needed), fetches and checks out
+the current commit, transfers configured datasets, runs `uv sync`, and fetches back
+any new results via `rsync`. Target Python/cache environment settings apply to
+`uv sync`; job `UV_OFFLINE` settings are omitted so login-node caches can be warmed online.
 
 Optionally also pushes/pulls datasets, see the ["Syncing datasets across clusters"](guides/syncing-datasets.md) guide.
 

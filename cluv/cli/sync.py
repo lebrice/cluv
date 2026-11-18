@@ -274,8 +274,9 @@ async def sync_per_cluster_part(
 ) -> list[Path]:
     """Sync steps specific to one cluster: install uv, clone/update the project, `uv sync`
     (with `extras` / `all_extras` passed on as `--extra` / `--all-extras`), create the results
-    dir and its `<project>/<results_symlink>` link, fetch back new results (unless
-    `sync_results` is False), and push datasets to the cluster if needed.
+    dir and its `<project>/<results_symlink>` link, and fetch back new results (unless
+    `sync_results` is False). Datasets are pushed before `uv sync` so configured Python
+    interpreters and package caches are available during dependency preparation.
 
     Does nothing (and returns an empty list) when `cluster_remote` is None (the current
     cluster), since there's nothing to sync to it.
@@ -293,22 +294,15 @@ async def sync_per_cluster_part(
     def _save():
         save_project_state(cluster, project_state)
 
-    if not config.manage_uv:
-        if sync_datasets and config.data_source:
-            await push_datasets_if_needed(remote, config, project_state)
-            _save()
-    else:
-        await install_uv(remote, project_state)
-        _save()
+    await install_uv(remote, project_state)
+    _save()
 
     await clone_project(remote, project_path=project_path, project_state=project_state)
     _save()
 
-    if not config.manage_uv:
-        prefix = target_environment(cluster_config.env)
-        await remote.get_output(
-            f"bash --login -c {shlex.quote(prefix + 'command -v uv && uv --version')}", hide=True
-        )
+    if sync_datasets and config.data_source:
+        await push_datasets_if_needed(remote, config, project_state)
+        _save()
 
     await run_uv_sync(
         remote,
@@ -317,7 +311,8 @@ async def sync_per_cluster_part(
         uv_cache_dir=cluster_config.env.get("UV_CACHE_DIR"),
         extras=extras,
         all_extras=all_extras,
-        env_vars=cluster_config.env if not config.manage_uv else None,
+        # Preserve target Python/cache paths, but warm caches online on the login node.
+        env_vars={key: value for key, value in cluster_config.env.items() if key != "UV_OFFLINE"},
     )
     _save()
 
@@ -341,10 +336,6 @@ async def sync_per_cluster_part(
         console.print(f"[green]Newly synced runs from [bold]{cluster}[/bold]:[/green]")
         for run_path in new_runs:
             console.print(f"  {run_path}")
-
-    if sync_datasets and config.data_source and config.manage_uv:
-        await push_datasets_if_needed(remote, config, project_state)
-        _save()
 
     return new_runs
 

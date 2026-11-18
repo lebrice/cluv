@@ -134,9 +134,6 @@ class CluvConfig(BaseModel):
     datasets_copy_links: bool = True
     """Follow source symlinks by default; false preserves reviewed closed relative links."""
 
-    manage_uv: bool = True
-    """Install/update uv normally; false uses and validates the configured target environment."""
-
     sbatch_args: SbatchArgs = {}
     """Global sbatch flags applied on all clusters.
 
