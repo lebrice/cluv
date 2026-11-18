@@ -13,6 +13,7 @@ remain per-cluster `datasets_path`; this is not a direct remote-to-remote servic
 data_source = "mila:/absolute/source/root"
 datasets_path = "$SCRATCH/datasets/project"
 datasets_rsync_filter = "$HOME/.cache/project/portable-sync-filter.rules"
+datasets_copy_links = false
 manage_uv = false
 
 [tool.cluv.local.env]
@@ -26,6 +27,12 @@ the whole root. Validate the selected files and symlink closure independently.
 Filtered pushes run rsync even when the source root mtime is unchanged, since nested
 files or filter contents may have changed. Missing/unresolved filters fail before
 preparation. No delete or whole-root mirror is implied.
+
+`datasets_copy_links` defaults to `true`, retaining the usual dataset behavior of
+following source links. Set it to `false` for a portable bundle whose manifest
+requires symlink types and exact relative link text: rsync archive mode then
+preserves links on both pull and push. Verify that the selected relative links
+are closed within the bundle before using this mode; cluv does not invent that proof.
 
 The existing `local.env` applies only off-cluster: the example resolves the
 desktop mirror under `$HOME/.cache/project/datasets/project`, while remote

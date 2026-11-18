@@ -16,6 +16,57 @@ from cluv.config import CluvConfig, PartialClusterConfig
 sync = importlib.import_module("cluv.cli.sync")
 
 
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync required")
+@pytest.mark.parametrize("policy", ["default", "preserve"])
+async def test_real_rsync_pull_and_push_follow_or_preserve_manifest_links(
+    tmp_path, monkeypatch, policy
+):
+    source, mirror, target = (tmp_path / name for name in ("source", "mirror", "target"))
+    payload = source / "required/archive-v0/dist/bytes"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("immutable payload")
+    link = source / "required/wheels-v5/dist"
+    link.parent.mkdir(parents=True)
+    link.symlink_to("../archive-v0/dist", target_is_directory=True)
+    rules = tmp_path / "filter"
+    rules.write_text("+ /required/***\n- /***\n")
+    options = {"datasets_copy_links": False} if policy == "preserve" else {}
+    config = CluvConfig(
+        results_path="results",
+        datasets_path=str(target),
+        datasets_rsync_filter=str(rules),
+        clusters={"fir": PartialClusterConfig()},
+        **options,
+    )
+    assert config.datasets_copy_links == (policy == "default")
+    monkeypatch.setattr(sync, "get_cluv_config", lambda: config)
+    commands = []
+
+    async def run(argv, **kwargs):
+        commands.append(argv)
+        assert ("--copy-links" in argv) == config.datasets_copy_links
+        local = [arg.removeprefix("mila:").removeprefix("fir:") for arg in argv]
+        return subprocess.run(local, capture_output=True, text=True, check=True)
+
+    monkeypatch.setattr(sync, "run", run)
+    await sync._pull_datasets(SimpleNamespace(hostname="mila"), str(source), mirror)
+    target.mkdir()
+    await sync._push_datasets_to_remote(
+        mirror, SimpleNamespace(hostname="fir", run=AsyncMock()), config, ProjectStateOnCluster()
+    )
+    assert len(commands) == 2
+    for root in (mirror, target):
+        copied = root / "required/wheels-v5/dist"
+        assert copied.is_symlink() == (policy == "preserve")
+        if policy == "preserve":
+            assert os.readlink(copied) == "../archive-v0/dist"  # Exact manifest link type/text.
+        else:
+            assert copied.is_dir()  # Existing default dereferences the link.
+        assert (copied / "bytes").read_text() == "immutable payload"
+    assert link.is_symlink() and os.readlink(link) == "../archive-v0/dist"
+    assert payload.read_text() == "immutable payload"
+
+
 @pytest.mark.parametrize("fetch_results", [True, False])
 def test_sync_cli_forwards_result_fetch_policy_to_preparation(monkeypatch, fetch_results):
     import cluv.__main__ as cli

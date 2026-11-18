@@ -131,6 +131,9 @@ class CluvConfig(BaseModel):
     datasets_rsync_filter: str | None = None
     """Controller-local rsync merge rules; unresolved/missing files fail before preparation."""
 
+    datasets_copy_links: bool = True
+    """Follow source symlinks by default; false preserves reviewed closed relative links."""
+
     manage_uv: bool = True
     """Install/update uv normally; false uses and validates the configured target environment."""
 
