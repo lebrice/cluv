@@ -243,8 +243,9 @@ cluv submit <cluster> [<job.sh>] [options] [sbatch-args...] [-- program-args...]
 Heterogeneous `:` overrides retain distinct per-component resources. Without `:`,
 common CLI options and configured account/time defaults apply to every header
 component. Heterogeneous jobs are sent through the original `sbatch` command using
-an in-memory header and the canonical script body on `/dev/stdin`, preserving
-program arguments. No site filter is bypassed. `--vram` and `--chunking` require
+an in-memory header and the canonical script body on standard input, with no
+filename argument. A safely quoted `set --` prolog preserves every program
+argument before the canonical body. No site filter is bypassed. `--vram` and `--chunking` require
 non-heterogeneous jobs; use explicit GPU requests and time limits for each role.
 
 `--test-only`

@@ -1167,7 +1167,7 @@ def get_sbatch_command(
     sbatch_flags = sbatch_args_to_list(sbatch_args)
     stdin_script = None
     if script_contents is not None:
-        stdin_script = heterogeneous_script(script_contents, sbatch_args)
+        stdin_script = heterogeneous_script(script_contents, sbatch_args, program_args)
         sbatch_flags = sbatch_args_to_list(
             {
                 key: value
@@ -1216,13 +1216,15 @@ def get_sbatch_command(
         delimiter = "CLUV_SCRIPT_" + hashlib.sha256(stdin_script.encode()).hexdigest()
         inner_command = (
             f"{env_vars_prefix}{cd_command}{sbatch} "
-            f"{' '.join(map(double_quote, sbatch_flags))} /dev/stdin {shlex.join(program_args)} "
+            f"{' '.join(map(double_quote, sbatch_flags))} "
             f"<<'{delimiter}'\n{stdin_script}\n{delimiter}"
         )
     return f"bash --login -c {shlex.quote(inner_command)}"
 
 
-def heterogeneous_script(contents: str, args: SbatchArgs) -> str:
+def heterogeneous_script(
+    contents: str, args: SbatchArgs, program_args: list[str] | None = None
+) -> str:
     """Submit through site sbatch filters using header resources, never CLI ':'."""
     lines = contents.splitlines()
     shebang = lines.pop(0) if lines and lines[0].startswith("#!") else "#!/bin/bash"
@@ -1246,7 +1248,10 @@ def heterogeneous_script(contents: str, args: SbatchArgs) -> str:
         flags = sbatch_args_to_list(resources)
         if flags:
             headers.append("#SBATCH " + shlex.join(flags))
-    return "\n".join([shebang, *headers, *preamble, *lines[boundary:]])
+    # No filename means stdin for native Slurm and site filters alike. Positional
+    # arguments must live in the script, or sbatch mistakes the first for a file.
+    argv = ["set -- " + shlex.join(program_args)] if program_args is not None else []
+    return "\n".join([shebang, *headers, *preamble, *argv, *lines[boundary:]])
 
 
 async def submit_job(submission: Submission, log_path: Path) -> Job:

@@ -203,10 +203,10 @@ def test_real_shell_passes_het_stdin_and_program_args_through_original_sbatch(tm
 
     binary = tmp_path / "sbatch"
     binary.write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$@" > "$TRACE_ARGS"\ncat > "$TRACE_SCRIPT"\nprintf "%s\\n" "$PATH" > "$TRACE_PATH"\necho 123\n'
+        '#!/bin/sh\nfor arg in "$@"; do case "$arg" in /dev/stdin|-) exit 9;; esac; done\nprintf "%s\\n" "$@" > "$TRACE_ARGS"\ncat > "$TRACE_SCRIPT"\nprintf "%s\\n" "$PATH" > "$TRACE_PATH"\nbash "$TRACE_SCRIPT"\necho 123\n'
     )
     binary.chmod(0o755)
-    script = '#!/bin/bash\n#SBATCH --nodes=12\n#SBATCH hetjob\n#SBATCH --nodes=21\necho "$UNEXPANDED_MODEL"\n'
+    script = '#!/bin/bash\n#SBATCH --nodes=12\n#SBATCH hetjob\n#SBATCH --nodes=21\nprintf "%s\\0" "$@" > "$TRACE_PROGRAM_ARGS"\necho "$UNEXPANDED_MODEL"\n'
     args = {
         "job-name": "cluv-race-unique-123",
         "nodes": "1",
@@ -217,16 +217,29 @@ def test_real_shell_passes_het_stdin_and_program_args_through_original_sbatch(tm
             {"nodes": "1", "gpus-per-node": "h100:4", "account": "ordinary", "time": "00:20:00"}
         ],
     }
+    program = [
+        "--train-data",
+        "/data with spaces/train.parquet",
+        "--",
+        "--max-steps",
+        "8",
+        "",
+        "literal$HOME",
+        "apostrophe'quote",
+        "line\nbreak",
+        f"literal;touch {tmp_path / 'NOT_EXECUTED'}",
+    ]
     command = get_sbatch_command(
         PurePosixPath("canonical.sh"),
         args,
-        ["--train-data", "/data with spaces/train.parquet", "--", "--max-steps", "8"],
+        program,
         dict(
             PATH=f"{tmp_path}:$PATH",
             GIT_COMMIT="frozen",
             TRACE_ARGS=str(tmp_path / "args"),
             TRACE_SCRIPT=str(tmp_path / "script"),
             TRACE_PATH=str(tmp_path / "path"),
+            TRACE_PROGRAM_ARGS=str(tmp_path / "program-args"),
         ),
         script_contents=script,
     )
@@ -237,12 +250,6 @@ def test_real_shell_passes_het_stdin_and_program_args_through_original_sbatch(tm
     assert actual_args == [
         "--parsable",
         "--job-name=cluv-race-unique-123",
-        "/dev/stdin",
-        "--train-data",
-        "/data with spaces/train.parquet",
-        "--",
-        "--max-steps",
-        "8",
     ]
     body = (tmp_path / "script").read_text()
     assert body.count("#SBATCH hetjob") == 1
@@ -250,7 +257,12 @@ def test_real_shell_passes_het_stdin_and_program_args_through_original_sbatch(tm
     assert body.count("--account=ordinary") == body.count("--time=00:20:00") == 2
     assert "h100:2" in body and "h100:4" in body and "--nodes=12" not in body
     assert 'echo "$UNEXPANDED_MODEL"' in body
+    assert body.endswith(script.split("#SBATCH --nodes=21\n", 1)[1])
     assert (tmp_path / "path").read_text().startswith(f"{tmp_path}:")
+    assert (tmp_path / "program-args").read_bytes().split(b"\0")[:-1] == [
+        arg.encode() for arg in program
+    ]
+    assert not (tmp_path / "NOT_EXECUTED").exists()
 
 
 @pytest.mark.parametrize("selector", ["", "not-configured"])
