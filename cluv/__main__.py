@@ -193,6 +193,11 @@ def add_submit_args(subparsers: Subparsers):
         usage="cluv submit <cluster> [<job.sh>] [sbatch-args...] [-- program-args...]",
     )
     submit_parser.add_argument(
+        "--site-overrides",
+        type=Path,
+        help="Submit-only TOML with per-site component resources and literal program argument prefixes.",
+    )
+    submit_parser.add_argument(
         "--eligible-clusters",
         help="Comma-separated approved clusters for submit first; never adds other connected clusters.",
     )

@@ -243,6 +243,16 @@ cluv submit <cluster> [<job.sh>] [options] [sbatch-args...] [-- program-args...]
     Exclusions apply to every heterogeneous component and cannot be cleared by an
     eligibility override. For example, a project can exclude `cc-debug*` accounts.
 
+`--site-overrides=PATH`
+:   Read a submit-only TOML file with `[sites.NAME]` tables containing optional
+    `resources` (one table per canonical header component) and literal
+    `program_args_prefix`. Merge resources after configured account variants and
+    before explicit CLI flags. Environment, account and identity overrides are
+    rejected; eligibility policy still applies. Exact bytes are retained in a
+    private mode-0600 artifact with path/SHA256 receipts. See
+    [site-specific resources](guides/submit/racing-clusters.md#site-specific-resources-and-application-paths).
+
+
 Heterogeneous `:` overrides retain distinct per-component resources. Without `:`,
 common CLI options and configured account/time defaults apply to every header
 component. Heterogeneous jobs are sent through the original `sbatch` command using

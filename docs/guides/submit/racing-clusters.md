@@ -133,3 +133,47 @@ just `<job_id>` for a single-cluster submission), and suppresses everything else
 $ cluv submit first scripts/job.sh --parsable -- python main.py
 narval:1234
 ```
+
+## Site-specific resources and application paths
+
+For a mixed-resource race, `cluv submit first --site-overrides race.toml -- ...`
+can apply a reviewed, submit-only overlay without changing project configuration:
+
+```toml
+[sites.rorqual]
+program_args_prefix = ["--model", "/scratch/example/models/model"]
+
+[[sites.rorqual.resources]]
+nodes = 1
+ntasks-per-node = 1
+gpus-per-node = "h100:2"
+mem = "64G"
+time = "00:20:00"
+
+[[sites.rorqual.resources]]
+nodes = 1
+ntasks-per-node = 4
+gpus-per-node = "h100:4"
+mem = "128G"
+time = "00:20:00"
+```
+
+Each named site must already be configured. If supplied, `resources` must have
+exactly one table per canonical script component. Merge order is script headers,
+configured account variant, site resources, then explicit CLI flags. A replacement
+GPU, task-count or memory selector removes inherited competing aliases; `false`
+clears a resource (for example `mem = false`). Account eligibility and exclusions
+still apply. Account, partition, job identity, transport and environment overrides
+are not accepted in this file.
+
+`program_args_prefix` contains literal argv before the common application args;
+it does not expand shell variables or add a role separator. Later application
+arguments may override earlier ones, so omit conflicting common model/path flags.
+Use only arguments accepted by every role receiving the prefix; role-specific
+data paths should stay in the existing launcher or role arguments.
+
+The file is read once and validated before connecting. Exact input bytes are
+saved in a private mode-0600 submission artifact; logs and submission receipts
+record its path and SHA256. Without this option, existing submission behavior is
+unchanged. Establish target runtime/assets and validate the merged resources with
+the original site scheduler before submitting an expensive race.

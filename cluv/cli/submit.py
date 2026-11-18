@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import datetime
 import fnmatch
@@ -41,6 +42,7 @@ from cluv.config import ClusterConfig, find_pyproject, get_cluv_config
 from cluv.remote import Remote, command_log_files, run
 from cluv.sbatch_args import SbatchArgs, sbatch_args_from_list, sbatch_args_to_list
 from cluv.slurm import TERMINAL_JOB_STATES, get_job_states_with_sacct
+from cluv.site_overrides import SiteOverrides, load_site_overrides
 from cluv.utils import console, gather_dict, group_by_cluster, set_context
 
 logger = logging.getLogger(__name__)
@@ -59,7 +61,13 @@ def component_count(submission: Submission) -> int:
 def eligible_submission(
     submission: Submission, accounts: list[str] | None, excluded: list[str]
 ) -> bool:
-    groups = [submission.sbatch_args, *submission.sbatch_args.get("__het_components__", [])]
+    return eligible_resource_accounts(submission.sbatch_args, accounts, excluded)
+
+
+def eligible_resource_accounts(
+    resources: SbatchArgs, accounts: list[str] | None, excluded: list[str]
+) -> bool:
+    groups = [resources, *resources.get("__het_components__", [])]
     configured = [str(group.get("account", "")) for group in groups]
     return not any(
         fnmatch.fnmatchcase(a, pattern) for a in configured for pattern in excluded
@@ -247,6 +255,7 @@ async def submit(
     eligible_clusters: str | None = None,
     eligible_accounts: str | None = None,
     exclude_accounts: str | None = None,
+    site_overrides: Path | None = None,
 ) -> Job | None:
     """Submit a job to the given cluster (or all clusters if `cluster=="first"`),
     and return the Job object if successful.
@@ -288,6 +297,34 @@ async def submit(
         raise ValueError("Eligible cluster selection contains an unconfigured cluster")
     if approved_clusters and cluster != "first" and cluster not in approved_clusters:
         raise ValueError(f"Cluster {cluster!r} is outside the eligible cluster policy")
+    overrides = (
+        load_site_overrides(site_overrides, get_cluv_config().clusters_names)
+        if site_overrides
+        else None
+    )
+    if overrides is not None:
+        validate_site_override_counts(overrides, job_script, sbatch_args, chunking, vram)
+        # Reject a fully excluded account selection before opening transport.
+        selected = approved_clusters if cluster == "first" else [cluster]
+        selected = selected or get_cluv_config().clusters_names
+        if not any(
+            eligible_resource_accounts(
+                merge_job_resources(
+                    get_local_job_script(
+                        job_script, name, get_cluv_config().get_cluster_config(name)
+                    ),
+                    resources,
+                    sbatch_args,
+                    overrides.for_site(name).resources,
+                ),
+                approved_accounts,
+                excluded_accounts,
+            )
+            for name in selected
+            for resources in get_cluv_config().get_cluster_config(name).sbatch_args
+        ):
+            raise ValueError("No eligible configured cluster/account submissions")
+    snapshot = save_site_override_snapshot(overrides) if overrides else None
     if test_only:
         await submit_test_only(
             approved_clusters if cluster == "first" and approved_clusters else cluster,
@@ -298,10 +335,15 @@ async def submit(
             vram=vram,
             eligible_accounts=approved_accounts,
             exclude_accounts=excluded_accounts,
+            **({"overrides": overrides} if overrides is not None else {}),
         )
         return None
     submit_command = build_submit_command(
-        cluster=cluster, job_script=job_script, sbatch_args=sbatch_args, program_args=program_args
+        cluster=cluster,
+        job_script=job_script,
+        sbatch_args=sbatch_args,
+        program_args=program_args,
+        site_overrides=site_overrides,
     )
     git_commit = ensure_clean_git_state(autocommit=autocommit, submit_command=submit_command)
     cluster_to_remote = await get_cluster_to_remote(
@@ -324,6 +366,7 @@ async def submit(
                 chunking=chunking,
                 vram=vram,
                 git_commit=git_commit,
+                **({"overrides": overrides} if overrides is not None else {}),
             )
             for cluster_name, remote in cluster_to_remote.items()
         }
@@ -353,7 +396,13 @@ async def submit(
     for rows in cluster_to_job_submissions.values():
         for row in rows:
             row.log_path.write_text(
-                f"cluster: {row.cluster}\ncommand: {row.job.sbatch_command}\n\n--- sync ---\n"
+                f"cluster: {row.cluster}\ncommand: {row.job.sbatch_command}\n"
+                + (
+                    f"site_overrides_sha256: {overrides.sha256}\nsite_overrides_snapshot: {snapshot}\n"
+                    if overrides
+                    else ""
+                )
+                + "\n--- sync ---\n"
             )
 
     if not _skip_sync:
@@ -440,6 +489,7 @@ async def submit_test_only(
     vram: str | None,
     eligible_accounts: list[str] | None = None,
     exclude_accounts: list[str] | None = None,
+    overrides: SiteOverrides | None = None,
 ) -> list[dry_run.TestOnlyResult]:
     """`cluv submit --test-only`: push the current commit, pull it on each cluster, and run
     `sbatch --test-only` there, the way `cluv submit` would run `sbatch` (same directory, same
@@ -469,6 +519,7 @@ async def submit_test_only(
                 vram=vram,
                 git_commit=git_commit,
                 test_only=True,
+                **({"overrides": overrides} if overrides is not None else {}),
             )
         except ValueError as err:
             # E.g. no job script for this cluster: a rejected row, not a crash that
@@ -915,6 +966,7 @@ async def get_submissions(
     git_commit: str,
     vram: str | None = None,
     test_only: bool = False,
+    overrides: SiteOverrides | None = None,
 ) -> list[Submission]:
     """Expand the possible job configurations for a cluster. Returns a list of `Submission` objects.
 
@@ -935,6 +987,9 @@ async def get_submissions(
             cluster_config, project_dir=PurePosixPath(str(find_pyproject().parent.resolve()))
         )
     job_resources_options = cluster_config.sbatch_args
+    site = overrides.for_site(cluster) if overrides is not None else None
+    if site is not None:
+        program_args = [*site.program_args_prefix, *program_args]
 
     # Get job vars
     job_env_vars = get_job_env_vars(
@@ -960,7 +1015,12 @@ async def get_submissions(
     )
 
     for job_resources in job_resources_options:
-        job_resources = merge_job_resources(local_job_script_path, job_resources, sbatch_args)
+        job_resources = merge_job_resources(
+            local_job_script_path,
+            job_resources,
+            sbatch_args,
+            site.resources if site is not None else None,
+        )
         if component_count_args(job_resources) > 1 and (vram is not None or chunking is not None):
             raise ValueError(
                 "Heterogeneous jobs require explicit per-component GPUs and time; --vram/--chunking are unsupported"
@@ -1003,7 +1063,7 @@ async def get_submissions(
                     remote=remote,
                     job_script=local_job_script_path,
                     sbatch_args=expanded_resources,
-                    program_args=program_args,
+                    program_args=list(program_args) if overrides is not None else program_args,
                     sbatch_command=sbatch_command,
                     n_chunks=n_chunks,
                     git_commit=git_commit,
@@ -1016,7 +1076,12 @@ def component_count_args(args: SbatchArgs) -> int:
     return 1 + len(args.get("__het_components__", []))
 
 
-def merge_job_resources(script: Path, configured: SbatchArgs, cli: list[str]) -> SbatchArgs:
+def merge_job_resources(
+    script: Path,
+    configured: SbatchArgs,
+    cli: list[str],
+    site_resources: tuple[dict, ...] | None = None,
+) -> SbatchArgs:
     """Preserve het headers; common config/CLI options apply to each component.
 
     With explicit ':' separators, CLI groups instead override their matching
@@ -1034,20 +1099,78 @@ def merge_job_resources(script: Path, configured: SbatchArgs, cli: list[str]) ->
     parsed_cli = sbatch_args_from_list(cli)
     header_groups = [parsed_header, *parsed_header.get("__het_components__", [])]
     cli_groups = [parsed_cli, *parsed_cli.get("__het_components__", [])]
-    if len(header_groups) == len(cli_groups) == 1:
+    if len(header_groups) == len(cli_groups) == 1 and site_resources is None:
         return merge_sbatch_args(configured, cli)
+    if site_resources is not None and len(site_resources) != len(header_groups):
+        raise ValueError("Site resource component count must match the canonical job header")
     if len(cli_groups) > 1 and len(cli_groups) != len(header_groups):
         raise ValueError("CLI heterogeneous component count must match the job header")
     merged = []
     for index, header_group in enumerate(header_groups):
         base = {k: v for k, v in header_group.items() if k != "__het_components__"}
-        base.update(configured)
         override = cli_groups[index] if len(cli_groups) > 1 else parsed_cli
-        base.update({k: v for k, v in override.items() if k != "__het_components__"})
+        if site_resources is not None:
+            base = apply_resource_layer({}, base)
+            base = apply_resource_layer(base, configured)
+            base = apply_resource_layer(base, site_resources[index])
+            base = apply_resource_layer(base, override)
+        else:
+            base.update(configured)
+            base.update({k: v for k, v in override.items() if k != "__het_components__"})
         merged.append(base)
     result = merged[0]
     result["__het_components__"] = merged[1:]
     return result
+
+
+def apply_resource_layer(base: SbatchArgs, layer: SbatchArgs) -> SbatchArgs:
+    aliases = {
+        "n": "ntasks",
+        "G": "gpus",
+        "N": "nodes",
+        "c": "cpus-per-task",
+        "t": "time",
+        "A": "account",
+    }
+    layer = {
+        aliases.get(k, k): copy.deepcopy(v) for k, v in layer.items() if k != "__het_components__"
+    }
+    result = copy.deepcopy(base)
+    for family in (
+        {"gpus", "gpus-per-node", "gpus-per-task", "gres"},
+        {"ntasks", "ntasks-per-node"},
+        {"mem", "mem-per-cpu", "mem-per-gpu"},
+    ):
+        if family & layer.keys():
+            for key in family - layer.keys():
+                result.pop(key, None)
+    result.update(layer)
+    return result
+
+
+def validate_site_override_counts(overrides, job_script, cli, chunking, vram):
+    config = get_cluv_config()
+    for name in overrides.sites:
+        site = overrides.for_site(name)
+        cluster_config = config.get_cluster_config(name)
+        script = get_local_job_script(job_script, name, cluster_config)
+        for resources in cluster_config.sbatch_args:
+            merged = merge_job_resources(script, resources, cli, site.resources)
+            if component_count_args(merged) > 1 and (chunking is not None or vram is not None):
+                raise ValueError(
+                    "Heterogeneous site overrides require explicit component resources"
+                )
+
+
+def save_site_override_snapshot(overrides: SiteOverrides) -> Path:
+    path = (
+        get_submission_log_dir() / f"site-overrides-{time.time_ns()}-{overrides.sha256[:12]}.toml"
+    )
+    # Never echo the file contents. Mode600 even if the directory is shared.
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+        stream.write(overrides.raw)
+    console.log(f"Site overrides SHA256 {overrides.sha256}; private snapshot {path}")
+    return path
 
 
 def get_local_job_script(
@@ -1477,9 +1600,12 @@ def build_submit_command(
     job_script: str | Path | PurePosixPath | None,
     sbatch_args: list[str],
     program_args: list[str],
+    site_overrides: Path | None = None,
 ) -> str:
     """Build the local `cluv submit` command line used to launch the job."""
     command_parts = ["cluv", "submit", cluster]
+    if site_overrides is not None:
+        command_parts.extend(["--site-overrides", str(site_overrides)])
     if job_script is not None:
         command_parts.append(str(job_script))
     command_parts.extend(sbatch_args)
